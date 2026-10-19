@@ -1,0 +1,15 @@
+{
+  "ollama": { "host": "http://127.0.0.1:11434", "keepAlive": "10m", "timeoutMs": 900000 },
+  "models": {
+    "strategist": "qwen3:8b",
+    "compliance": "qwen3:8b",
+    "pm": "qwen3:8b",
+    "engineer": "qwen2.5-coder:14b",
+    "engineerFast": "qwen2.5-coder:7b",
+    "reviewer": "qwen3:8b"
+  },
+  "contextTokens": 12288,
+  "build": { "maxAttemptsPerTask": 3, "testTimeoutMs": 60000, "maxTasksPerCycle": 8 },
+  "loop": { "maxCyclesPerDay": 4, "sleepMinutes": 30 },
+  "allowNpmInstall": false
+}

@@ -1,0 +1,18 @@
+{
+  "name": "factory",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@bradygaster/squad-cli": "^1.0.0",
+    "@fission-ai/openspec": "^1.14.3",
+    "backlog.md": "^1.54.0"
+  }
+}
