@@ -92,12 +92,14 @@ function applyFiles(dir, files) {
 }
 const setStatus = (t, s) => backlog(['task', 'edit', t.id.replace(/\D/g, ''), '-s', s]);
 
+// Escalation ladder: small model first, then the large (slow) model.
 async function buildTask(slug, dir, task) {
   const idea = JSON.parse(read(path.join(paths.ideas, slug + '.json')));
   let feedback = '';
-  for (let attempt = 1; attempt <= cfg.build.maxAttemptsPerTask; attempt++) {
+  const ladder = [...Array(cfg.build.attemptsSmall).fill('engineer'), ...Array(cfg.build.attemptsLarge).fill('engineerLarge')];
+  for (let attempt = 1; attempt <= ladder.length; attempt++) {
     haltCheck();
-    const role = attempt === cfg.build.maxAttemptsPerTask ? 'engineer' : 'engineer';
+    const role = ladder[attempt - 1];
     const prompt = `Product: ${idea.title}\n${idea.problem}\n\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
     const reply = await chat(role, persona('engineer') + '\n\n' + RULES(), prompt, { temperature: 0.2 + attempt * 0.1 });
     const files = parseFiles(reply);
@@ -111,7 +113,60 @@ async function buildTask(slug, dir, task) {
     if (review.verdict !== 'pass') { feedback = '\nReviewer rejected:\n- ' + (review.issues || []).join('\n- '); log('review-fail', { slug, msg: feedback.slice(0, 200) }); continue; }
     return { ok: true, summary: review.summary };
   }
-  return { ok: false };
+  return { ok: false, failure: feedback.slice(0, 3000) };
+}
+
+const commit = (dir, msg) => { git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', msg); };
+const rollback = (dir) => { git(dir, 'reset', '-q', '--hard'); git(dir, 'clean', '-fdq'); };
+const num = (t) => t.id.replace(/\D/g, '');
+const depthOf = (t) => Math.max(0, ...t.labels.map((l) => (l.match(/^depth-(\d+)$/) || [, 0])[1]).map(Number));
+
+// Ask the large model to rescope a failing task into smaller, independently testable subtasks.
+async function split(slug, dir, task, failure) {
+  const depth = depthOf(task) + 1;
+  const out = await chatJson('planner', persona('splitter') + '\n\n' + RULES(),
+    `TASK ${task.id}: ${task.title}\n${task.body}\n\nWhy it failed:\n${failure}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}`);
+  const subs = (out.subtasks || []).slice(0, 4);
+  if (subs.length < 2) return [];
+  const ids = [];
+  for (const [i, s] of subs.entries()) {
+    const args = ['task', 'create', `${task.title} (${i + 1}/${subs.length}): ${s.title}`, '-d', `${s.description}\n\nFiles: ${(s.files || []).join(', ')}\nSplit from ${task.id}; ${out.note || ''}`,
+      '-l', `${slug},depth-${depth}`, '-p', num(task), '--plain'];
+    for (const a of s.acceptance || []) args.push('--ac', a);
+    backlog(args);
+  }
+  const fresh = listTasks(slug).filter((t) => t.labels.includes(`depth-${depth}`) && t.status !== 'Done' && t.title.startsWith(task.title + ' ('));
+  log('task-split', { slug, msg: `${task.id} -> ${fresh.map((t) => t.id).join(', ')}` });
+  return fresh;
+}
+
+// Returns true when the task (or all its subtasks) is complete.
+async function runTask(slug, dir, task) {
+  haltCheck();
+  setStatus(task, 'In Progress');
+  const r = await buildTask(slug, dir, task);
+  if (r.ok) {
+    commit(dir, `${task.id}: ${task.title}`);
+    backlog(['task', 'edit', num(task), '-s', 'Done', '--final-summary', r.summary || 'Implemented, tests green, reviewed.']);
+    log('task-done', { slug, msg: task.id + ' ' + task.title });
+    return true;
+  }
+  rollback(dir);
+  if (depthOf(task) < cfg.build.maxSplitDepth) {
+    const subs = await split(slug, dir, task, r.failure);
+    if (subs.length) {
+      let all = true;
+      for (const s of subs) if (!(await runTask(slug, dir, s))) { all = false; break; }
+      if (all) {
+        backlog(['task', 'edit', num(task), '-s', 'Done', '--add-label', 'split', '--final-summary', 'Rescoped automatically into subtasks; all completed.']);
+        return true;
+      }
+    }
+  }
+  backlog(['task', 'edit', num(task), '-s', 'To Do', '--add-label', 'blocked']);
+  log('task-blocked', { slug, msg: task.id + ' exhausted all models and rescoping' });
+  requestHuman('blocked-task', slug, [`${task.id} ${task.title} failed on small model, large model, and ${cfg.build.maxSplitDepth} levels of automatic rescoping.`, `Last failure: ${(r.failure || '').slice(0, 500)}`]);
+  return false;
 }
 
 async function build(slug) {
@@ -120,23 +175,12 @@ async function build(slug) {
   if (!exists(path.join(dir, '.git'))) { git(dir, 'init', '-q'); }
   let done = 0;
   for (const task of listTasks(slug)) {
-    if (task.status === 'Done' || task.labels.includes('blocked')) continue;
+    if (task.status === 'Done' || task.labels.includes('blocked') || depthOf(task) > 0) continue;
     if (done >= cfg.build.maxTasksPerCycle) break;
-    haltCheck();
-    setStatus(task, 'In Progress');
-    const r = await buildTask(slug, dir, task);
-    if (r.ok) {
-      git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', `${task.id}: ${task.title}`);
-      backlog(['task', 'edit', task.id.replace(/\D/g, ''), '-s', 'Done', '--final-summary', r.summary || 'Implemented, tests green, reviewed.']);
-      done++; log('task-done', { slug, msg: task.id + ' ' + task.title });
-    } else {
-      backlog(['task', 'edit', task.id.replace(/\D/g, ''), '-s', 'To Do', '-l', 'blocked']);
-      log('task-blocked', { slug, msg: task.id + ' needs human/larger-model help' });
-      requestHuman('blocked-task', slug, [`${task.id} ${task.title} failed ${cfg.build.maxAttemptsPerTask} attempts. Consider rescoping or using a stronger model.`]);
-      break;
-    }
+    if (!(await runTask(slug, dir, task))) break;
+    done++;
   }
-  return listTasks(slug).every((t) => t.status === 'Done');
+  return listTasks(slug).filter((t) => depthOf(t) === 0).every((t) => t.status === 'Done');
 }
 
 // ---------- 4. RELEASE PACKAGE (human publishes) ----------

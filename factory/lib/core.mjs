@@ -59,12 +59,26 @@ export async function chat(role, system, user, { json = false, temperature = 0.4
   if (json) body.format = 'json';
   const res = await fetch(cfg.ollama.host + '/api/chat', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(cfg.ollama.timeoutMs),
+    body: JSON.stringify({ ...body, stream: true }), signal: AbortSignal.timeout(cfg.ollama.timeoutMs),
   });
   if (!res.ok) throw new Error(`ollama ${res.status}: ${await res.text()}`);
-  const j = await res.json();
-  log('llm', { role, model, msg: `${role}/${model} ${j.eval_count ?? '?'} tok` });
-  return (j.message?.content ?? '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  // Streamed so slow CPU-bound models never hit a headers/idle timeout.
+  let content = '', evalCount = 0, buf = '';
+  const dec = new TextDecoder();
+  for await (const chunk of res.body) {
+    buf += dec.decode(chunk, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line) continue;
+      const j = JSON.parse(line);
+      if (j.error) throw new Error('ollama: ' + j.error);
+      content += j.message?.content ?? '';
+      if (j.eval_count) evalCount = j.eval_count;
+    }
+  }
+  log('llm', { role, model, msg: `${role}/${model} ${evalCount || '?'} tok` });
+  return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 export async function chatJson(role, system, user, tries = 3) {
   let err;
