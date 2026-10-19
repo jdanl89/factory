@@ -14,7 +14,7 @@ const exists = fs.existsSync;
 // ---------- 1. IDEATE ----------
 async function ideate(hint = '') {
   haltCheck();
-  const existing = exists(paths.ideas) ? fs.readdirSync(paths.ideas).map((f) => f.replace('.json', '')) : [];
+  const existing = exists(paths.ideas) ? fs.readdirSync(paths.ideas).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', '')) : [];
   const idea = await chatJson('strategist', persona('strategist') + '\n\n' + RULES(),
     `Existing ideas (do not duplicate): ${existing.join(', ') || 'none'}.\n${hint ? 'Human hint: ' + hint : 'Choose freely.'}`);
   idea.name = slugify(idea.name || idea.title);
@@ -160,12 +160,12 @@ async function cycle(hint) {
   if (await build(slug)) await release(slug);
 }
 function status() {
-  const ideas = exists(paths.ideas) ? fs.readdirSync(paths.ideas).map((f) => JSON.parse(read(path.join(paths.ideas, f)))) : [];
+  const ideas = exists(paths.ideas) ? fs.readdirSync(paths.ideas).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(read(path.join(paths.ideas, f)))) : [];
   for (const i of ideas) {
     const t = listTasks(i.name);
     console.log(`${i.name.padEnd(30)} ${i.status.padEnd(16)} tasks ${t.filter((x) => x.status === 'Done').length}/${t.length}`);
   }
-  const pend = exists(paths.approvals) ? fs.readdirSync(paths.approvals) : [];
+  const pend = exists(paths.approvals) ? fs.readdirSync(paths.approvals).filter((f) => f.endsWith('.md')) : [];
   console.log(`\nPending human items: ${pend.length}${pend.length ? '\n  ' + pend.join('\n  ') : ''}`);
 }
 async function loop() {
