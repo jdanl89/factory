@@ -3,13 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  ROOT, cfg, rulesText, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
+  ROOT, cfg, rulesText, principles, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
   chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman, setScope, stopFile,
 } from './lib/core.mjs';
-import { mechanicalEval, tree } from './lib/evaluate.mjs';
+import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
+import { ensureDeps, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
+import { scout, toolsList, toolsDecide } from './lib/scout.mjs';
 import { gatherSignals, loadFreshResearch, saveResearch } from './lib/research.mjs';
 
-const RULES = () => `GOLDEN RULES:\n${rulesText()}`;
+const RULES = () => `GOLDEN RULES:\n${rulesText()}\n\n${principles()}\n${preferredText()}`;
 const read = (f) => fs.readFileSync(f, 'utf8');
 const exists = fs.existsSync;
 
@@ -92,7 +94,7 @@ function materialize(slug, pl, changeName, extraLabels) {
 function snapshot(dir) {
   const out = [];
   const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-    if (e.name === '.git' || e.name === 'node_modules') continue;
+    if (e.name === '.git' || e.name === 'node_modules' || e.name === 'package-lock.json') continue;
     const f = path.join(d, e.name);
     e.isDirectory() ? walk(f) : out.push(`FILE: ${path.relative(dir, f).replace(/\\/g, '/')}\n\`\`\`\n${read(f).slice(0, 6000)}\n\`\`\``);
   } };
@@ -105,11 +107,16 @@ function parseFiles(text) {
   let m; while ((m = re.exec(text))) files.push({ rel: m[1].trim().replace(/\\/g, '/'), content: m[2] + '\n' });
   return files;
 }
-function applyFiles(dir, files) {
+function applyFiles(dir, files, deps = declared(dir)) {
   const problems = [];
   for (const f of files) {
     try {
+      if (/(^|\/)(package(-lock)?\.json)$/.test(f.rel)) { problems.push(`${f.rel}: do not write package files; list packages on a "DEPENDENCIES: a, b" line and the factory installs them`); continue; }
       const v = codeViolations(f.rel, f.content);
+      if (/\.(mjs|js|cjs)$/.test(f.rel) && !/^public\//.test(f.rel)) {
+        const und = undeclaredImports(f.content, deps);
+        if (und.length) v.push(`${f.rel}: imports undeclared package(s) ${und.join(', ')}; add them to the DEPENDENCIES line`);
+      }
       if (v.length) { problems.push(...v); continue; }
       const full = safeJoin(dir, f.rel);
       fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -132,7 +139,10 @@ async function buildTask(slug, dir, task) {
     const reply = await chat(role, persona('engineer') + '\n\n' + RULES(), prompt, { temperature: 0.2 + attempt * 0.1 });
     const files = parseFiles(reply);
     if (!files.length) { feedback = '\nYour last reply had no parsable FILE blocks. Follow the output format exactly.'; continue; }
+    const dep = await ensureDeps(dir, slug, parseDependencies(reply));
+    const depNote = dep.rejected.length ? '\nPackages rejected by the factory (choose a different standard package or built-in): ' + dep.rejected.map((r) => `${r.name} (${r.reason})`).join('; ') + '\n' : '';
     const problems = applyFiles(dir, files);
+    if (depNote) problems.push(depNote);
     if (problems.length) { feedback = '\nRejected by guard, fix these:\n' + problems.join('\n'); log('guard', { slug, msg: problems.join(' | ') }); continue; }
     const t = runTests(dir);
     if (!t.ok) { feedback = `\nTests FAILED (attempt ${attempt}). Fix them:\n${t.out}`; log('tests-fail', { slug, msg: task.id + ' attempt ' + attempt }); continue; }
@@ -201,6 +211,7 @@ async function build(slug, label) {
   const dir = path.join(paths.products, slug);
   fs.mkdirSync(dir, { recursive: true });
   if (!exists(path.join(dir, '.git'))) { git(dir, 'init', '-q'); }
+  ensureGitignore(dir);
   // Work left by an interrupted run is stashed (never discarded) so a stop-now can't poison the next task.
   if (git(dir, 'rev-parse', '--verify', '-q', 'HEAD').status === 0 && git(dir, 'status', '--porcelain').stdout.trim()) {
     git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'stash', 'push', '-u', '-m', 'factory-interrupted-' + Date.now());
@@ -315,7 +326,11 @@ async function evaluate(slug, n) {
   const history = st.history.map((h) => `iteration ${h.n}: ${h.theme} (score ${h.score}, ${h.done}/${h.tasks} tasks done)`).join('\n') || 'none (this is the first evaluation)';
   const open = listTasks(slug).filter((t) => t.status !== 'Done').map((t) => `${t.id} ${t.title} [${t.labels.includes('blocked') ? 'BLOCKED' : t.status}]`).join('\n') || 'none';
   const smoke = mech.smoke.checks.map((c) => `${c.ok ? 'PASS' : 'FAIL'} ${c.name} ${c.detail}`).join('\n');
-  const prompt = `PRODUCT: ${idea.title} - ${idea.tagline || ''}\nProblem: ${idea.problem}\nAudience: ${idea.audience}\nMonetization: ${idea.monetization}\n` +
+  const hand = [];
+  const srcText = fs.existsSync(path.join(dir, 'src')) ? fs.readdirSync(path.join(dir, 'src'), { recursive: true }).filter((f) => /\.(mjs|js)$/.test(f)).map((f) => ({ f, t: read(path.join(dir, 'src', f)) })) : [];
+  for (const [re, what] of [[/createHmac|createSign|createCipheriv|pbkdf2|scryptSync/, 'hand-rolled crypto/password/token code'], [/createServer\s*\(/, 'raw node:http server instead of a web framework'], [/set-cookie|Set-Cookie/, 'hand-rolled cookie/session handling'], [/JSON\.parse\(.*body|req\.on\(['"]data/, 'manual request-body parsing/validation']])
+    for (const s of srcText) if (re.test(s.t)) { hand.push(`${s.f}: ${what}`); break; }
+  const prompt = `PRODUCT: ${idea.title} - ${idea.tagline || ''}\nDECLARED DEPENDENCIES: ${declared(dir).join(', ') || 'none'}\nPOSSIBLE HAND-ROLLED CODE (heuristic; verify): ${hand.join(' | ') || 'none detected'}\nProblem: ${idea.problem}\nAudience: ${idea.audience}\nMonetization: ${idea.monetization}\n` +
     `Planned mvp_scope: ${JSON.stringify(idea.mvp_scope)}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
     (idea.human_constraints?.length ? `HUMAN CONSTRAINTS:\n- ${idea.human_constraints.join('\n- ')}\n` : '') +
     `\nEARLIER ITERATIONS:\n${history}\n\nOPEN/BLOCKED TASKS:\n${open}\n\nMECHANICAL RESULTS\nTests ${mech.tests.ok ? 'PASSED' : 'FAILED'}:\n${mech.tests.out.slice(-1500)}\nSmoke test:\n${smoke}\nServer stderr: ${mech.smoke.stderr || '(none)'}\nStats: ${JSON.stringify(mech.stats)}\n\nFILE TREE:\n${tree(dir)}\n\nSOURCE:\n${snapshot(dir)}`;
@@ -476,6 +491,7 @@ async function afterRelease(slug) {
   else if (m === 'auto') await iterateLoop(slug, { auto: true });
 }
 async function cycle(hint) {
+  try { await scout(false); } catch (e) { log('scout-error', { msg: e.message }); }
   const slug = await ideate(hint);
   if (!slug) return;
   await plan(slug);
@@ -519,8 +535,12 @@ const cmds = {
   'iterate-approve': () => iterateApprove(arg, rest),
   'iterate-reject': () => iterateReject(arg, rest),
   'iterate-stop': () => iterateStop(arg, rest.includes('--now')),
+  scout: () => scout(true).then(() => toolsList()),
+  tools: () => toolsList(),
+  'tools-approve': () => toolsDecide(arg, 'approve', rest),
+  'tools-reject': () => toolsDecide(arg, 'reject'),
   halt: () => fs.writeFileSync(path.join(ROOT, 'HALT'), 'stop'),
   resume: () => fs.rmSync(path.join(ROOT, 'HALT'), { force: true }),
 };
-if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|halt|resume>'); process.exit(1); }
+if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|scout|tools|tools-approve <id> [--url U --roles r1,r2]|tools-reject <id>|halt|resume>'); process.exit(1); }
 Promise.resolve(cmds[cmd]()).catch((e) => { log('fatal', { msg: e.stack }); process.exit(1); });

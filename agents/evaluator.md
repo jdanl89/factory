@@ -10,12 +10,15 @@ Assess:
 5. Test quality: untested modules, tests that assert nothing.
 6. Spec coverage: which items from the idea's mvp_scope / phase2 / phase3 are implemented, partial, or missing.
 7. Value: would the target user pay for this? What is the single biggest gap between this and a product people would pay for?
+8. Reuse: flag every hand-rolled implementation of a solved problem (auth/sessions/JWT, OAuth2, password hashing, validation, routing/HTTP framework, CSRF, rate limiting, security headers, parsing). Check DECLARED DEPENDENCIES and the heuristic hints. Name the standard package that should replace each one.
 
 Respond with ONLY JSON:
 {"quality_score":1-10,"works":true|false,
  "summary":"3 sentences",
  "bugs":[{"title":"...","severity":"critical|high|medium|low","detail":"...","files":["..."]}],
  "security_issues":[{"title":"...","severity":"critical|high|medium|low","detail":"...","files":["..."]}],
+ "reinvented_wheels":[{"what":"custom X","replace_with":"standard-npm-package","files":["..."]}],
+ "tooling_suggestions":["an MCP server / skill / tool that would have helped, if any"],
  "ux_issues":["..."],"test_gaps":["..."],
  "spec_coverage":{"done":["..."],"partial":["..."],"missing":["..."]},
  "biggest_value_gap":"...","improvement_ideas":["..."]}

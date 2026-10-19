@@ -10,11 +10,40 @@
     "planner": "qwen3-coder:30b",
     "analyst": "qwen3-coder:30b",
     "evaluator": "qwen3-coder:30b",
+    "scout": "qwen3-coder:30b",
     "reviewer": "qwen3:8b"
   },
   "contextTokens": 16384,
   "build": { "attemptsSmall": 2, "attemptsLarge": 2, "maxSplitDepth": 2, "testTimeoutMs": 60000, "maxTasksPerCycle": 40 },
   "loop": { "maxCyclesPerDay": 4, "sleepMinutes": 30 },
   "iterate": { "afterRelease": "manual", "maxIterations": 25, "maxTasksPerIteration": 8, "convergeScore": 9 },
+  "dependencies": {
+    "enabled": true, "maxPerProduct": 25, "minWeeklyDownloads": 20000, "maxStaleDays": 730,
+    "allowedLicenses": "^(MIT|ISC|BSD-[23]-Clause|Apache-2\\.0|0BSD|MPL-2\\.0|BlueOak-1\\.0\\.0)",
+    "blocklist": [],
+    "preferred": {
+      "web framework / routing": "express (or fastify)",
+      "request validation / schemas": "zod",
+      "password hashing": "bcryptjs",
+      "sessions": "express-session (cookie store) or cookie-session",
+      "JWT / JWS / JWE": "jose",
+      "OAuth2 / OpenID Connect client": "openid-client",
+      "OAuth2 server-side helpers": "oauth4webapi",
+      "security headers": "helmet",
+      "CSRF": "csrf-csrf",
+      "rate limiting": "express-rate-limit",
+      "logging": "pino",
+      "dates": "date-fns",
+      "markdown": "marked (+ dompurify via isomorphic-dompurify for sanitising)",
+      "CSV": "csv-parse / csv-stringify",
+      "YAML": "yaml",
+      "file uploads": "multer",
+      "email (inactive until configured)": "nodemailer",
+      "payments (inactive until configured)": "stripe",
+      "PDF": "pdf-lib",
+      "testing HTTP": "node:test + global fetch (no extra package)"
+    }
+  },
+  "tooling": { "scoutEveryHours": 168, "maxCandidates": 40 },
   "allowNpmInstall": false
 }

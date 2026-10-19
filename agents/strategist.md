@@ -7,7 +7,7 @@ Ambition: a real web-based SaaS product, not a toy script. It should have user a
 
 Hard constraints:
 - Obey the GOLDEN RULES.
-- Zero runtime dependencies: Node.js built-ins only (node:http, node:sqlite, node:crypto, node:test), static HTML/CSS/vanilla JS frontend, no CDN/external assets, no outbound network calls from the product.
+- Build on standard, well-known npm packages (express, zod, bcryptjs, jose, openid-client, ...) rather than custom code; Node built-ins (node:sqlite, node:test) where they suffice. Static HTML/CSS/vanilla JS frontend, no CDN/external assets, no outbound network calls from the product itself (external-service integrations stay inactive until the human configures them).
 - Cannot depend on any paid service. Anything needing money or accounts is a human step.
 - Do not duplicate existing ideas.
 

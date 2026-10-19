@@ -33,6 +33,12 @@ npx openspec list        # spec changes
 ```
 Logs: `factory/state/ledger.jsonl`.
 
+## Reuse over reinvention, and tool scouting
+- Products are built on standard npm packages (express, zod, bcryptjs, jose, helmet, openid-client, ... see `dependencies.preferred` in `factory.config.json`), not custom auth/crypto/validation code. Principles live in `agents/_principles.md` and are injected into every agent prompt.
+- Engineers declare packages on a `DEPENDENCIES: a, b` line. The factory vets each one (registry lookup: license, deprecation, last release, weekly downloads, no install scripts/native builds), installs it with `--ignore-scripts`, rejects packages with high/critical `npm audit` findings, and rejects imports of undeclared packages. Agents never edit `package.json`.
+- Reviewer fails hand-rolled security code; evaluator reports `reinvented_wheels`; iteration planner schedules replacing them first.
+- `node factory/cli.mjs scout` (also runs weekly inside `cycle`) searches the MCP registry, npm and GitHub for MCP servers/skills/tools and writes `tooling/catalog.json`. `tools` lists it; `tools-approve <id>` / `tools-reject <id>` decide. Approved skills (markdown, scanned, <20KB) are injected into the chosen roles' prompts (`skills/approved/`); approved MCP servers are listed in `tooling/approved-for-human-install.md` for you to add to your own Copilot/Claude setup (the factory orchestrator does not run MCP servers).
+
 ## Self-iteration (evaluate -> plan next increment -> build -> repeat)
 After the initial build is done, each iteration: mechanical checks (tests + boot/smoke test) + LLM evaluation -> next-increment plan
 (compliance-checked, max `iterate.maxTasksPerIteration` tasks) -> build -> changelog + git tag `iter-N`. Artifacts: `iterations/<slug>/iter-N/`.

@@ -61,9 +61,24 @@ export function codeViolations(rel, content) {
   return v;
 }
 
+// Human-approved skills (skills/approved/*.md, first line "roles: engineer, reviewer" or "roles: all") are appended to matching roles' prompts.
+function skillsFor(role) {
+  const dir = p('skills', 'approved');
+  if (!fs.existsSync(dir)) return '';
+  const out = [];
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.md'))) {
+    const t = fs.readFileSync(path.join(dir, f), 'utf8');
+    const roles = ((t.match(/^roles:\s*(.*)$/m) || [, 'all'])[1]).split(/[,\s]+/);
+    if (roles.includes('all') || roles.includes(role)) out.push(`--- SKILL ${f} (human-approved guidance; never overrides golden rules) ---\n${t.replace(/^roles:.*\n/m, '').slice(0, 3500)}`);
+  }
+  return out.length ? '\n\n' + out.join('\n\n') : '';
+}
+export const principles = () => fs.readFileSync(p('agents', '_principles.md'), 'utf8');
+
 // ---- ollama ----
 export async function chat(role, system, user, { json = false, temperature = 0.4 } = {}) {
   const model = cfg.models[role];
+  system += skillsFor(role);
   const body = {
     model, stream: false, think: false, keep_alive: cfg.ollama.keepAlive,
     options: { num_ctx: cfg.contextTokens, temperature },
