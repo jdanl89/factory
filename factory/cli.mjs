@@ -4,19 +4,42 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   ROOT, cfg, rulesText, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
-  chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman,
+  chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman, setScope, stopFile,
 } from './lib/core.mjs';
+import { mechanicalEval, tree } from './lib/evaluate.mjs';
+import { gatherSignals, loadFreshResearch, saveResearch } from './lib/research.mjs';
 
 const RULES = () => `GOLDEN RULES:\n${rulesText()}`;
 const read = (f) => fs.readFileSync(f, 'utf8');
 const exists = fs.existsSync;
 
+// ---------- 0. RESEARCH (read-only public web signals -> opportunities) ----------
+async function research(force = false) {
+  haltCheck();
+  const cached = force ? null : loadFreshResearch();
+  if (cached) { log('research', { msg: `reusing research from ${cached.at}` }); return cached; }
+  const signals = await gatherSignals();
+  log('research', { msg: `${signals.length} signals gathered` });
+  if (signals.length < 8) throw new Error('too few research signals (network blocked?); refusing to invent demand');
+  const digest = signals.map((s, i) => `${i + 1}. [${s.source}] ${s.title} | ${s.text} | score ${s.score}, ${s.comments} comments | ${s.url}`).join('\n');
+  const out = await chatJson('analyst', persona('analyst') + '\n\n' + RULES(), `Signals:\n${digest}`);
+  const known = new Set(signals.map((s) => s.url));
+  const opps = (out.opportunities || []).map((o) => ({ ...o, evidence: (o.evidence || []).filter((u) => known.has(u)) })).filter((o) => o.evidence.length);
+  if (!opps.length) throw new Error('analyst returned no evidence-backed opportunities');
+  const res = { at: new Date().toISOString(), signals, opportunities: opps };
+  saveResearch(res);
+  log('research', { msg: `${opps.length} evidence-backed opportunities` });
+  return res;
+}
+
 // ---------- 1. IDEATE ----------
 async function ideate(hint = '') {
   haltCheck();
   const existing = exists(paths.ideas) ? fs.readdirSync(paths.ideas).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', '')) : [];
+  const r = await research();
   const idea = await chatJson('strategist', persona('strategist') + '\n\n' + RULES(),
-    `Existing ideas (do not duplicate): ${existing.join(', ') || 'none'}.\n${hint ? 'Human hint: ' + hint : 'Choose freely.'}`);
+    `Existing ideas (do not duplicate): ${existing.join(', ') || 'none'}.\n${hint ? 'Human hint: ' + hint : 'Choose the best opportunity.'}\n\nResearched opportunities:\n${JSON.stringify(r.opportunities, null, 1)}`);
+  if (!Array.isArray(idea.evidence) || !idea.evidence.length) idea.evidence = r.opportunities[0].evidence;
   idea.name = slugify(idea.name || idea.title);
   const hit = denylistHit(JSON.stringify(idea));
   let verdict = { approved: !hit, violations: hit ? [`denylist match: ${hit}`] : [], needs_human: [] };
@@ -37,8 +60,15 @@ async function plan(slug) {
   if (idea.status !== 'approved') throw new Error('idea not approved');
   const pl = await chatJson('pm', persona('pm') + '\n\n' + RULES(), JSON.stringify(idea));
   if (!Array.isArray(pl.tasks) || !pl.tasks.length || !Array.isArray(pl.requirements)) throw new Error('bad plan shape');
+  materialize(slug, pl, slug, []);
+  idea.status = 'planned';
+  fs.writeFileSync(ideaFile, JSON.stringify(idea, null, 2));
+}
+
+// Writes the OpenSpec change and creates the backlog.md tasks for a plan.
+function materialize(slug, pl, changeName, extraLabels) {
   const cap = slugify(pl.capability || slug);
-  const dir = path.join(paths.openspec, 'changes', slug);
+  const dir = path.join(paths.openspec, 'changes', changeName);
   fs.mkdirSync(path.join(dir, 'specs', cap), { recursive: true });
   fs.writeFileSync(path.join(dir, 'proposal.md'), `## Why\n${pl.why}\n\n## What Changes\n${pl.what_changes}\n\n## Impact\n- Affected specs: ${cap}\n- Product: products/${slug}\n`);
   fs.writeFileSync(path.join(dir, 'design.md'), `## Design\n${pl.design}\n`);
@@ -47,18 +77,16 @@ async function plan(slug) {
     (r.scenarios?.length ? r.scenarios : [{ name: 'Basic', when: 'used normally', then: 'it works as described' }])
       .map((s) => `#### Scenario: ${s.name}\n- **WHEN** ${s.when}\n- **THEN** ${s.then}\n`).join('\n')).join('\n');
   fs.writeFileSync(path.join(dir, 'specs', cap, 'spec.md'), `## ADDED Requirements\n${specs}`);
-  const v = spawnSync(process.execPath, [path.join(ROOT, 'node_modules', '@fission-ai', 'openspec', 'bin', 'openspec.js'), 'validate', slug, '--type', 'change'], { cwd: ROOT, encoding: 'utf8' });
-  log('openspec-validate', { slug, msg: (v.status === 0 ? 'valid' : 'INVALID ' + (v.stdout + v.stderr).slice(0, 300)) });
-  for (const t of pl.tasks) {
-    const desc = `${t.description}\n\nFiles: ${(t.files || []).join(', ')}\nSpec: openspec/changes/${slug}`;
-    const args = ['task', 'create', t.title, '-d', desc, '-l', slug, '--plain'];
-    for (const a of t.acceptance || []) args.push('--ac', a);
-    backlog(args);
+  const v = spawnSync(process.execPath, [path.join(ROOT, 'node_modules', '@fission-ai', 'openspec', 'bin', 'openspec.js'),   'validate', changeName, '--type', 'change'], { cwd: ROOT, encoding: 'utf8' });
+    log('openspec-validate', { slug, msg: (v.status === 0 ? 'valid' : 'INVALID ' + (v.stdout + v.stderr).slice(0, 300)) });
+    for (const t of pl.tasks) {
+      const desc = `${t.description}\n\nFiles: ${(t.files || []).join(', ')}\nSpec: openspec/changes/${changeName}`;
+      const args = ['task', 'create', t.title, '-d', desc, '-l', [slug, ...extraLabels].join(','), '--plain'];
+      for (const a of t.acceptance || []) args.push('--ac', a);
+      backlog(args);
+    }
+    log('plan', { slug, msg: `${pl.tasks.length} tasks created (${changeName})` });
   }
-  idea.status = 'planned';
-  fs.writeFileSync(ideaFile, JSON.stringify(idea, null, 2));
-  log('plan', { slug, msg: `${pl.tasks.length} tasks created` });
-}
 
 // ---------- 3. BUILD (TDD loop with test + review gates) ----------
 function snapshot(dir) {
@@ -100,7 +128,7 @@ async function buildTask(slug, dir, task) {
   for (let attempt = 1; attempt <= ladder.length; attempt++) {
     haltCheck();
     const role = ladder[attempt - 1];
-    const prompt = `Product: ${idea.title}\n${idea.problem}\n\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
+    const prompt = `Product: ${idea.title}\n${idea.problem}\n${idea.human_constraints?.length ? 'HUMAN CONSTRAINTS (mandatory, override anything else):\n- ' + idea.human_constraints.join('\n- ') + '\n' : ''}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
     const reply = await chat(role, persona('engineer') + '\n\n' + RULES(), prompt, { temperature: 0.2 + attempt * 0.1 });
     const files = parseFiles(reply);
     if (!files.length) { feedback = '\nYour last reply had no parsable FILE blocks. Follow the output format exactly.'; continue; }
@@ -169,18 +197,24 @@ async function runTask(slug, dir, task) {
   return false;
 }
 
-async function build(slug) {
+async function build(slug, label) {
   const dir = path.join(paths.products, slug);
   fs.mkdirSync(dir, { recursive: true });
   if (!exists(path.join(dir, '.git'))) { git(dir, 'init', '-q'); }
+  // Work left by an interrupted run is stashed (never discarded) so a stop-now can't poison the next task.
+  if (git(dir, 'rev-parse', '--verify', '-q', 'HEAD').status === 0 && git(dir, 'status', '--porcelain').stdout.trim()) {
+    git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'stash', 'push', '-u', '-m', 'factory-interrupted-' + Date.now());
+    log('stash', { slug, msg: 'stashed uncommitted changes from an interrupted run' });
+  }
+  const scoped = () => listTasks(slug).filter((t) => !label || t.labels.includes(label));
   let done = 0;
-  for (const task of listTasks(slug)) {
+  for (const task of scoped()) {
     if (task.status === 'Done' || task.labels.includes('blocked') || depthOf(task) > 0) continue;
     if (done >= cfg.build.maxTasksPerCycle) break;
     if (!(await runTask(slug, dir, task))) break;
     done++;
   }
-  return listTasks(slug).filter((t) => depthOf(t) === 0).every((t) => t.status === 'Done');
+  return scoped().filter((t) => depthOf(t) === 0).every((t) => t.status === 'Done');
 }
 
 // ---------- 4. RELEASE PACKAGE (human publishes) ----------
@@ -196,18 +230,264 @@ async function release(slug) {
   const idf = path.join(paths.ideas, slug + '.json'); const idea2 = JSON.parse(read(idf)); idea2.status = 'ready-for-human'; fs.writeFileSync(idf, JSON.stringify(idea2, null, 2));
 }
 
+// ---------- scrap: delete everything related to one idea/product ----------
+function scrap(slug, confirmed) {
+  if (!slug || !/^[a-z0-9-]+$/.test(slug)) throw new Error('usage: scrap <slug> [--yes]  (slug = lowercase letters, digits, hyphens)');
+  const targets = [];
+  const add = (f) => exists(f) && targets.push(f);
+  add(path.join(paths.ideas, slug + '.json'));
+  add(path.join(paths.openspec, 'changes', slug));
+  add(path.join(paths.openspec, 'changes', 'archive', slug));
+  add(path.join(paths.products, slug));
+  add(paths.p('iterations', slug));
+  const chg = paths.p('openspec', 'changes');
+  if (exists(chg)) for (const d of fs.readdirSync(chg)) if (new RegExp(`^${slug}-iter-\\d+$`).test(d)) add(path.join(chg, d));
+  if (exists(paths.approvals)) for (const f of fs.readdirSync(paths.approvals)) if (f.includes(`-${slug}-`)) add(path.join(paths.approvals, f));
+  for (const d of ['tasks', 'completed', path.join('archive', 'tasks')]) {
+    const dir = paths.p('backlog', d);
+    if (!exists(dir)) continue;
+    for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.md'))) {
+      const fm = (read(path.join(dir, f)).match(/^---\r?\n([\s\S]*?)\r?\n---/) || [, ''])[1];
+      const labels = ((fm.match(/^labels:\s*(.*)$/m) || [, ''])[1].match(/[\w-]+/g) || []);
+      if (labels.includes(slug)) add(path.join(dir, f));
+    }
+  }
+  if (!targets.length) { console.log(`Nothing found for "${slug}".`); return; }
+  console.log(`${confirmed ? 'Deleting' : 'Would delete'}:\n` + targets.map((t) => '  ' + path.relative(ROOT, t)).join('\n'));
+  if (!confirmed) { console.log('\nRe-run with --yes to delete. (Stop any running cycle/loop first: node factory/cli.mjs halt)'); return; }
+  const failed = [];
+  for (const t of targets) {
+    try { fs.rmSync(t, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch (e) { failed.push(`${path.relative(ROOT, t)} (${e.code})`); }
+  }
+  log('scrapped', { slug, msg: `${targets.length - failed.length}/${targets.length} items removed` });
+  if (failed.length) console.log('\nCould not delete (in use by another process? close terminals/editors there and retry):\n  ' + failed.join('\n  '));
+  else console.log('\nDone. The ledger (factory/state/ledger.jsonl) is kept as an audit trail.');
+}
+
+// ---------- human decision on an idea ----------
+function approve(slug, args) {
+  const f = path.join(paths.ideas, slug + '.json');
+  if (!slug || !exists(f)) throw new Error('usage: approve <slug> [--note "constraint"]... (idea must exist in ideas/)');
+  const idea = JSON.parse(read(f));
+  const notes = [];
+  for (let i = 0; i < args.length; i++) if (args[i] === '--note' && args[i + 1]) notes.push(args[++i]);
+  if (idea.status === 'planned' || idea.status === 'ready-for-human') throw new Error(`already ${idea.status}; scrap it first to restart`);
+  idea.human_override = { at: new Date().toISOString(), previous_status: idea.status, previous_compliance: idea.compliance };
+  idea.human_constraints = [...(idea.human_constraints || []), ...notes];
+  idea.status = 'approved';
+  fs.writeFileSync(f, JSON.stringify(idea, null, 2));
+  for (const a of fs.readdirSync(paths.approvals).filter((x) => x.includes(`-${slug}-needs-human`))) fs.rmSync(path.join(paths.approvals, a));
+  log('human-approved', { slug, msg: `${slug} approved by human with ${notes.length} constraint(s)` });
+  console.log(`Approved ${slug}. Constraints for the team:\n${notes.map((n) => '  - ' + n).join('\n') || '  (none)'}\nNext: node factory/cli.mjs plan ${slug}   (or run: build ${slug} after planning)`);
+}
+function reject(slug) {
+  const f = path.join(paths.ideas, slug + '.json');
+  const idea = JSON.parse(read(f)); idea.status = 'rejected'; fs.writeFileSync(f, JSON.stringify(idea, null, 2));
+  log('human-rejected', { slug, msg: slug });
+}
+
+// ---------- 5. ITERATE: evaluate -> plan next increment -> build -> repeat ----------
+const stateFile = (slug) => paths.p('iterations', slug, 'state.json');
+const iterPath = (slug, n, f) => paths.p('iterations', slug, `iter-${n}`, f);
+const loadIdea = (slug) => {
+  const f = path.join(paths.ideas, slug + '.json');
+  if (!slug || !exists(f)) throw new Error(`unknown idea "${slug}"`);
+  return JSON.parse(read(f));
+};
+const loadState = (slug) => (exists(stateFile(slug)) ? JSON.parse(read(stateFile(slug))) : { count: 0, current: null, history: [] });
+const writeJson = (f, o) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, JSON.stringify(o, null, 2)); };
+const parseNotes = (args) => { const n = []; for (let i = 0; i < args.length; i++) if (args[i] === '--note' && args[i + 1]) n.push(args[++i]); return n; };
+const flagVal = (args, name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const iterLabel = (t) => t.labels.some((l) => /^iter-\d+$/.test(l));
+
+function requireBuilt(slug) {
+  loadIdea(slug);
+  const open = listTasks(slug).filter((t) => depthOf(t) === 0 && !iterLabel(t) && t.status !== 'Done');
+  if (!exists(path.join(paths.products, slug)) || !listTasks(slug).length) throw new Error(`${slug} has not been planned/built yet`);
+  if (open.length) throw new Error(`initial build not finished (${open.length} open task(s)); run: build ${slug}`);
+}
+
+async function evaluate(slug, n) {
+  const dir = path.join(paths.products, slug);
+  const idea = loadIdea(slug);
+  const mech = await mechanicalEval(dir);
+  const st = loadState(slug);
+  const history = st.history.map((h) => `iteration ${h.n}: ${h.theme} (score ${h.score}, ${h.done}/${h.tasks} tasks done)`).join('\n') || 'none (this is the first evaluation)';
+  const open = listTasks(slug).filter((t) => t.status !== 'Done').map((t) => `${t.id} ${t.title} [${t.labels.includes('blocked') ? 'BLOCKED' : t.status}]`).join('\n') || 'none';
+  const smoke = mech.smoke.checks.map((c) => `${c.ok ? 'PASS' : 'FAIL'} ${c.name} ${c.detail}`).join('\n');
+  const prompt = `PRODUCT: ${idea.title} - ${idea.tagline || ''}\nProblem: ${idea.problem}\nAudience: ${idea.audience}\nMonetization: ${idea.monetization}\n` +
+    `Planned mvp_scope: ${JSON.stringify(idea.mvp_scope)}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
+    (idea.human_constraints?.length ? `HUMAN CONSTRAINTS:\n- ${idea.human_constraints.join('\n- ')}\n` : '') +
+    `\nEARLIER ITERATIONS:\n${history}\n\nOPEN/BLOCKED TASKS:\n${open}\n\nMECHANICAL RESULTS\nTests ${mech.tests.ok ? 'PASSED' : 'FAILED'}:\n${mech.tests.out.slice(-1500)}\nSmoke test:\n${smoke}\nServer stderr: ${mech.smoke.stderr || '(none)'}\nStats: ${JSON.stringify(mech.stats)}\n\nFILE TREE:\n${tree(dir)}\n\nSOURCE:\n${snapshot(dir)}`;
+  const ev = await chatJson('evaluator', persona('evaluator') + '\n\n' + RULES(), prompt);
+  ev.quality_score = Number(ev.quality_score) || 0;
+  ev.mechanical = { tests_ok: mech.tests.ok, smoke: mech.smoke.checks, stats: mech.stats };
+  log('evaluate', { slug, msg: `iteration ${n}: score ${ev.quality_score}/10, tests ${mech.tests.ok ? 'pass' : 'FAIL'}, smoke ${mech.smoke.checks.filter((c) => !c.ok).length} failing` });
+  return ev;
+}
+
+async function planIteration(slug, n, ev, feedback) {
+  const idea = loadIdea(slug);
+  const max = cfg.iterate.maxTasksPerIteration;
+  const prompt = `Plan iteration ${n}. Maximum tasks: ${max}. Task titles must start with "I${n}: ".\n\nPRODUCT: ${idea.title}\nProblem: ${idea.problem}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
+    (idea.human_constraints?.length ? `HUMAN CONSTRAINTS (mandatory):\n- ${idea.human_constraints.join('\n- ')}\n` : '') +
+    (feedback ? `\nHUMAN/COMPLIANCE FEEDBACK ON THE PREVIOUS PLAN (mandatory):\n${feedback}\n` : '') +
+    `\nEARLIER ITERATIONS:\n${loadState(slug).history.map((h) => `${h.n}: ${h.theme}`).join('\n') || 'none'}\n\nEVALUATION:\n${JSON.stringify({ ...ev, mechanical: { tests_ok: ev.mechanical.tests_ok, failing_smoke: ev.mechanical.smoke.filter((c) => !c.ok), stats: ev.mechanical.stats } }, null, 1)}`;
+  const pl = await chatJson('planner', persona('iteration-planner') + '\n\n' + RULES(), prompt);
+  pl.tasks = (Array.isArray(pl.tasks) ? pl.tasks : []).slice(0, max).map((t) => ({ ...t, title: /^I\d+:/.test(t.title) ? t.title : `I${n}: ${t.title}` }));
+  pl.converged = !!pl.converged || !pl.tasks.length;
+  pl.theme = pl.theme || `iteration ${n}`;
+  if (!Array.isArray(pl.requirements) || !pl.requirements.length) pl.requirements = [{ name: pl.theme, text: `The system SHALL deliver: ${pl.rationale || pl.theme}`, scenarios: [] }];
+  const hit = denylistHit(JSON.stringify(pl));
+  const verdict = hit ? { approved: false, violations: [`denylist match: ${hit}`] }
+    : await chatJson('compliance', persona('compliance') + '\n\n' + RULES(), JSON.stringify({ product: idea.title, constraints: idea.human_constraints || [], iteration_plan: { theme: pl.theme, rationale: pl.rationale, tasks: pl.tasks.map((t) => ({ title: t.title, description: t.description })) } }));
+  return { plan: pl, verdict };
+}
+
+// Returns 'done' | 'partial' | 'converged' | 'awaiting' | 'blocked'. Resumable: state is persisted after every phase.
+async function runIteration(slug, { planOnly = false } = {}) {
+  setScope(slug);
+  requireBuilt(slug);
+  const dir = path.join(paths.products, slug);
+  const st = loadState(slug);
+  if (!st.current || st.current.phase === 'done') { st.current = { n: st.count + 1, phase: 'start', startedAt: new Date().toISOString() }; writeJson(stateFile(slug), st); }
+  const n = st.current.n;
+  const save = (phase, extra = {}) => { st.current = { ...st.current, phase, ...extra }; writeJson(stateFile(slug), st); };
+  const phase = () => st.current.phase;
+  if (phase() === 'awaiting-approval') { console.log(`Iteration ${n} plan is awaiting your decision: iterate-approve ${slug} | iterate-reject ${slug} --note "..."`); return 'awaiting'; }
+  log('iteration', { slug, msg: `iteration ${n} starting at phase "${phase()}"` });
+
+  if (phase() === 'start') {
+    writeJson(iterPath(slug, n, 'evaluation.json'), await evaluate(slug, n));
+    save('evaluated');
+  }
+  if (phase() === 'evaluated') {
+    const ev = JSON.parse(read(iterPath(slug, n, 'evaluation.json')));
+    let feedback = st.current.feedback || '', res;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      haltCheck();
+      res = await planIteration(slug, n, ev, feedback);
+      if (res.verdict.approved) break;
+      feedback += `\nCompliance rejected the previous plan: ${(res.verdict.violations || []).join('; ')}. Revise it.`;
+    }
+    writeJson(iterPath(slug, n, 'plan.json'), res.plan);
+    if (!res.verdict.approved) {
+      requestHuman('iteration-compliance', slug, [`Iteration ${n} plan was rejected twice by compliance: ${(res.verdict.violations || []).join('; ')}`, `Plan: iterations/${slug}/iter-${n}/plan.json`, `Re-run: iterate ${slug} (re-plans), or give guidance with a constraint via approve ${slug} --note "..."`]);
+      return 'blocked';
+    }
+    if (res.plan.converged) { finishIteration(slug, st, n, ev, res.plan, [], dir); return 'converged'; }
+    save('planned', { feedback: '' });
+  }
+  if (phase() === 'planned') {
+    const pl = JSON.parse(read(iterPath(slug, n, 'plan.json')));
+    if (planOnly && !st.current.approved) {
+      requestHuman('iteration-plan', slug, [`Iteration ${n} theme: ${pl.theme}`, `Why: ${pl.rationale}`, ...pl.tasks.map((t) => `Task: ${t.title}`), `Edit iterations/${slug}/iter-${n}/plan.json to change it, then: node factory/cli.mjs iterate-approve ${slug} [--note "constraint"]`, `Or send it back: node factory/cli.mjs iterate-reject ${slug} --note "feedback"`]);
+      save('awaiting-approval');
+      console.log(`Iteration ${n} planned: "${pl.theme}" (${pl.tasks.length} tasks). Not acting until you run iterate-approve ${slug}.`);
+      return 'awaiting';
+    }
+    if (!listTasks(slug).some((t) => t.labels.includes(`iter-${n}`))) materialize(slug, pl, `${slug}-iter-${n}`, [`iter-${n}`]);
+    save('building');
+  }
+  if (phase() === 'building') {
+    await build(slug, `iter-${n}`);
+    const ev = JSON.parse(read(iterPath(slug, n, 'evaluation.json')));
+    const pl = JSON.parse(read(iterPath(slug, n, 'plan.json')));
+    const tasks = listTasks(slug).filter((t) => t.labels.includes(`iter-${n}`));
+    finishIteration(slug, st, n, ev, pl, tasks, dir);
+    return tasks.every((t) => t.status === 'Done') ? 'done' : 'partial';
+  }
+  return 'done';
+}
+
+function finishIteration(slug, st, n, ev, pl, tasks, dir) {
+  const done = tasks.filter((t) => t.status === 'Done').length;
+  const lines = tasks.map((t) => `- ${t.status === 'Done' ? '[x]' : '[ ] (blocked)'} ${t.title}`);
+  const date = new Date().toISOString().slice(0, 10);
+  if (tasks.length) {
+    const cl = path.join(dir, 'CHANGELOG.md');
+    fs.appendFileSync(cl, `${exists(cl) ? '' : '# Changelog\n'}\n## Iteration ${n} - ${pl.theme} (${date})\n${lines.join('\n')}\n`);
+    git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', `iteration ${n}: ${pl.theme}`);
+    git(dir, 'tag', '-f', `iter-${n}`);
+  }
+  fs.writeFileSync(iterPath(slug, n, 'summary.md'), `# Iteration ${n}: ${pl.theme}\n\nEvaluation score before: ${ev.quality_score}/10\n\n${ev.summary || ''}\n\n${pl.converged ? 'The planner judged the product converged: no worthwhile changes remain.\n' : `Why: ${pl.rationale}\n\n${lines.join('\n')}\n`}`);
+  st.history.push({ n, theme: pl.converged ? 'converged' : pl.theme, score: ev.quality_score, tasks: tasks.length, done, blocked: tasks.length - done, converged: !!pl.converged, at: new Date().toISOString() });
+  st.count = n;
+  st.current = { ...st.current, phase: 'done' };
+  writeJson(stateFile(slug), st);
+  log('iteration-done', { slug, msg: `iteration ${n} "${pl.theme}": ${done}/${tasks.length} tasks done, score before ${ev.quality_score}/10` });
+}
+
+// mode 1: iterate <slug> [--count N]      mode 2: --plan-only      mode 3: --auto [--max N]
+async function iterateLoop(slug, { count = 1, planOnly = false, auto = false, max } = {}) {
+  setScope(slug);
+  const since = Date.now();
+  const limit = auto ? (max || cfg.iterate.maxIterations) : count;
+  const stopAfter = () => ['all', slug].some((k) => { const f = stopFile('stop-after', k); return exists(f) && fs.statSync(f).mtimeMs >= since - 1000; });
+  let ran = 0, partial = 0;
+  while (ran < limit) {
+    haltCheck();
+    if (stopAfter()) { log('iterate-stop', { slug, msg: 'stop-after requested; stopping at iteration boundary' }); console.log('Stopped at iteration boundary as requested.'); break; }
+    const r = await runIteration(slug, { planOnly });
+    console.log(`Iteration result: ${r}`);
+    if (r === 'awaiting' || r === 'blocked') break;
+    ran++;
+    if (r === 'converged') { console.log('Planner judged the product converged. Stopping.'); break; }
+    partial = r === 'partial' ? partial + 1 : 0;
+    if (partial >= 2) { requestHuman('iteration-stalled', slug, ['Two consecutive iterations left blocked tasks; auto-iteration paused to avoid burning compute.', 'Review blocked tasks in the backlog, then run: iterate ' + slug]); break; }
+    if (planOnly) break;
+  }
+  if (auto && ran >= limit) log('iterate-limit', { slug, msg: `reached max of ${limit} iterations for this run` });
+}
+
+async function iterateApprove(slug, args) {
+  const st = loadState(slug);
+  if (st.current?.phase !== 'awaiting-approval') throw new Error(`no iteration plan awaiting approval for ${slug}`);
+  const notes = parseNotes(args);
+  if (notes.length) { const idea = loadIdea(slug); idea.human_constraints = [...(idea.human_constraints || []), ...notes]; writeJson(path.join(paths.ideas, slug + '.json'), idea); }
+  for (const a of fs.readdirSync(paths.approvals).filter((x) => x.includes(`-${slug}-iteration-plan`))) fs.rmSync(path.join(paths.approvals, a));
+  st.current = { ...st.current, phase: 'planned', approved: true };
+  writeJson(stateFile(slug), st);
+  log('iteration-approved', { slug, msg: `iteration ${st.current.n} approved by human` });
+  await iterateLoop(slug, args.includes('--auto') ? { auto: true, max: Number(flagVal(args, '--max')) || undefined } : { count: 1 });
+}
+function iterateReject(slug, args) {
+  const st = loadState(slug);
+  if (st.current?.phase !== 'awaiting-approval') throw new Error(`no iteration plan awaiting approval for ${slug}`);
+  for (const a of fs.readdirSync(paths.approvals).filter((x) => x.includes(`-${slug}-iteration-plan`))) fs.rmSync(path.join(paths.approvals, a));
+  st.current = { ...st.current, phase: 'evaluated', feedback: parseNotes(args).join('\n') || 'The human rejected the plan; propose a different one.', approved: false };
+  writeJson(stateFile(slug), st);
+  log('iteration-rejected', { slug, msg: `iteration ${st.current.n} plan sent back` });
+  console.log('Plan discarded. It will be re-planned with your feedback on the next: iterate ' + slug + ' [--plan-only]');
+}
+function iterateStop(target, now) {
+  if (!target) throw new Error('usage: iterate-stop <slug|all> [--now]');
+  const f = stopFile(now ? 'stop-now' : 'stop-after', target);
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, new Date().toISOString());
+  log('iterate-stop-requested', { slug: target, msg: now ? 'stop NOW (at next checkpoint, before the next model call)' : 'stop after current iteration' });
+  console.log(now ? `Stop requested for ${target}: the run exits at its next checkpoint (an in-flight model call may finish first). Unfinished work is stashed on resume; state is resumable.` : `Stop requested for ${target}: the loop finishes its current iteration, then stops.`);
+}
+
 // ---------- orchestration ----------
+async function afterRelease(slug) {
+  const m = cfg.iterate?.afterRelease || 'manual';
+  if (m === 'plan') await iterateLoop(slug, { planOnly: true });
+  else if (m === 'auto') await iterateLoop(slug, { auto: true });
+}
 async function cycle(hint) {
   const slug = await ideate(hint);
   if (!slug) return;
   await plan(slug);
-  if (await build(slug)) await release(slug);
+  if (await build(slug)) { await release(slug); await afterRelease(slug); }
 }
 function status() {
   const ideas = exists(paths.ideas) ? fs.readdirSync(paths.ideas).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(read(path.join(paths.ideas, f)))) : [];
   for (const i of ideas) {
     const t = listTasks(i.name);
-    console.log(`${i.name.padEnd(30)} ${i.status.padEnd(16)} tasks ${t.filter((x) => x.status === 'Done').length}/${t.length}`);
+    const it = loadState(i.name);
+    const itx = it.count || it.current ? `  iter ${it.count}${it.current && it.current.phase !== 'done' ? ` (#${it.current.n}: ${it.current.phase})` : ''}` : '';
+    console.log(`${i.name.padEnd(30)} ${i.status.padEnd(16)} tasks ${t.filter((x) => x.status === 'Done').length}/${t.length}${itx}`);
   }
   const pend = exists(paths.approvals) ? fs.readdirSync(paths.approvals).filter((f) => f.endsWith('.md')) : [];
   console.log(`\nPending human items: ${pend.length}${pend.length ? '\n  ' + pend.join('\n  ') : ''}`);
@@ -225,11 +505,22 @@ async function loop() {
 
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const cmds = {
+  research: () => research(true).then((r) => r.opportunities.forEach((o) => console.log(`- [${o.demand_strength}] ${o.saas_concept}\n    ${o.evidence.join(' ')}`))),
   ideate: () => ideate(arg ? [arg, ...rest].join(' ') : ''),
   plan: () => plan(arg), build: () => build(arg), release: () => release(arg),
   cycle: () => cycle(arg ? [arg, ...rest].join(' ') : ''), loop, status,
+  approve: () => approve(arg, rest),
+  reject: () => reject(arg),
+  scrap: () => scrap(arg, rest.includes('--yes') || arg === '--yes'),
+  iterate: () => iterateLoop(arg, {
+    count: Number(flagVal(rest, '--count')) || 1, planOnly: rest.includes('--plan-only'),
+    auto: rest.includes('--auto'), max: Number(flagVal(rest, '--max')) || undefined,
+  }),
+  'iterate-approve': () => iterateApprove(arg, rest),
+  'iterate-reject': () => iterateReject(arg, rest),
+  'iterate-stop': () => iterateStop(arg, rest.includes('--now')),
   halt: () => fs.writeFileSync(path.join(ROOT, 'HALT'), 'stop'),
   resume: () => fs.rmSync(path.join(ROOT, 'HALT'), { force: true }),
 };
-if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|halt|resume>'); process.exit(1); }
+if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|halt|resume>'); process.exit(1); }
 Promise.resolve(cmds[cmd]()).catch((e) => { log('fatal', { msg: e.stack }); process.exit(1); });

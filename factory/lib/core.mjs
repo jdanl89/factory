@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -15,8 +16,15 @@ export function log(event, data = {}) {
   fs.appendFileSync(p('factory', 'state', 'ledger.jsonl'), line + '\n');
   console.log(`[${event}] ${data.msg ?? data.slug ?? ''}`);
 }
+const START_MS = Date.now() - process.uptime() * 1000;
+let scope = null;
+export const setScope = (s) => { scope = s; };
+export const stopFile = (kind, slug) => p('factory', 'state', `${kind}-${slug}`);
+// A signal file only counts if it was written after this process started, so stale ones never block a fresh run.
+export const signalled = (kind, slug) => { const f = stopFile(kind, slug); return fs.existsSync(f) && fs.statSync(f).mtimeMs >= START_MS - 1000; };
 export function haltCheck() {
   if (fs.existsSync(p('HALT'))) { log('halt', { msg: 'HALT file present, stopping' }); process.exit(3); }
+  if (signalled('stop-now', 'all') || (scope && signalled('stop-now', scope))) { log('halt', { slug: scope, msg: 'stop-now requested, stopping immediately' }); process.exit(3); }
 }
 
 // ---- guard: golden-rule enforcement that does not depend on any LLM ----
@@ -42,10 +50,15 @@ export function safeJoin(base, rel) {
     throw new Error('protected path blocked: ' + rel);
   return full;
 }
-const CODE_BAD = [/\bchild_process\b/, /\bfetch\s*\(/, /\bhttps?\.(get|request)\s*\(/, /\bnode:(net|dgram|tls)\b/, /process\.env\.[A-Z_]*(KEY|TOKEN|SECRET|PASSWORD)/i];
+const CODE_BAD = [/\bchild_process\b/, /\bfetch\s*\(/, /\bhttps?\.(get|request)\s*\(/, /\bnode:(net|dgram|tls)\b/, /process\.env\.[A-Z_]*(KEY|TOKEN|SECRET|PASSWORD)/i, /\b(src|href)\s*=\s*["']https?:\/\/(?!127\.0\.0\.1|localhost)/i, /\bsrc\s*=\s*["']\/\//i];
 export function codeViolations(rel, content) {
-  if (!/\.(mjs|js|cjs|html)$/.test(rel) || /(^|\/)test\//.test(rel.replace(/\\/g, '/'))) return [];
-  return CODE_BAD.filter((r) => r.test(content)).map((r) => `${rel}: forbidden pattern ${r}`);
+  const r = rel.replace(/\\/g, '/');
+  if (!/\.(mjs|js|cjs|html)$/.test(r) || /(^|\/)test\//.test(r)) return [];
+  const browser = /^public\//.test(r);
+  const bad = CODE_BAD.filter((x) => !(browser && x.source.startsWith('\\bfetch')));
+  const v = bad.filter((x) => x.test(content)).map((x) => `${rel}: forbidden pattern ${x}`);
+  if (browser && /\bfetch\s*\(\s*[`"']?(https?:)?\/\//.test(content)) v.push(`${rel}: fetch to external origin`);
+  return v;
 }
 
 // ---- ollama ----
@@ -57,15 +70,18 @@ export async function chat(role, system, user, { json = false, temperature = 0.4
     messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
   };
   if (json) body.format = 'json';
-  const res = await fetch(cfg.ollama.host + '/api/chat', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...body, stream: true }), signal: AbortSignal.timeout(cfg.ollama.timeoutMs),
+  // node:http has no 5-minute headers timeout (unlike global fetch), so slow CPU-bound model loads are fine.
+  const u = new URL(cfg.ollama.host + '/api/chat');
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json' }, timeout: cfg.ollama.timeoutMs }, resolve);
+    req.on('timeout', () => req.destroy(new Error('ollama socket timeout')));
+    req.on('error', reject);
+    req.end(JSON.stringify({ ...body, stream: true }));
   });
-  if (!res.ok) throw new Error(`ollama ${res.status}: ${await res.text()}`);
-  // Streamed so slow CPU-bound models never hit a headers/idle timeout.
+  if (res.statusCode !== 200) { let t = ''; for await (const c of res) t += c; throw new Error(`ollama ${res.statusCode}: ${t}`); }
   let content = '', evalCount = 0, buf = '';
   const dec = new TextDecoder();
-  for await (const chunk of res.body) {
+  for await (const chunk of res) {
     buf += dec.decode(chunk, { stream: true });
     let i;
     while ((i = buf.indexOf('\n')) >= 0) {

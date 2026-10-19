@@ -23,11 +23,34 @@ node factory/cli.mjs cycle ["optional idea hint"]   # full pipeline once
 node factory/cli.mjs loop                           # continuous, capped per day (factory.config.json)
 node factory/cli.mjs ideate|plan <slug>|build <slug>|release <slug>
 node factory/cli.mjs status
+node factory/cli.mjs research                       # fetch public demand signals (cached 12h)
+node factory/cli.mjs approve <slug> [--note "constraint"]...   # accept an idea compliance rejected / add human constraints
+node factory/cli.mjs reject <slug>
+node factory/cli.mjs scrap <slug> [--yes]           # delete everything for an idea/product (dry-run without --yes)
 node factory/cli.mjs halt | resume                  # kill switch (creates/removes HALT)
 npx backlog board        # kanban TUI      npx backlog browser   # web UI
 npx openspec list        # spec changes
 ```
 Logs: `factory/state/ledger.jsonl`.
+
+## Self-iteration (evaluate -> plan next increment -> build -> repeat)
+After the initial build is done, each iteration: mechanical checks (tests + boot/smoke test) + LLM evaluation -> next-increment plan
+(compliance-checked, max `iterate.maxTasksPerIteration` tasks) -> build -> changelog + git tag `iter-N`. Artifacts: `iterations/<slug>/iter-N/`.
+```
+# 1. Manual: you trigger each iteration (or a bounded run)
+node factory/cli.mjs iterate <slug> [--count 3]
+# 2. Plan only: evaluate + plan, then wait for you (edit iterations/<slug>/iter-N/plan.json if you like)
+node factory/cli.mjs iterate <slug> --plan-only
+node factory/cli.mjs iterate-approve <slug> [--note "constraint"] [--auto]
+node factory/cli.mjs iterate-reject <slug> --note "feedback"    # re-plans with your feedback
+# 3. Fully automatic loop
+node factory/cli.mjs iterate <slug> --auto [--max 10]
+node factory/cli.mjs iterate-stop <slug|all>        # stop after the current iteration
+node factory/cli.mjs iterate-stop <slug|all> --now  # stop at the next checkpoint (resumable; partial work is stashed)
+```
+`cycle`/`loop` can chain this automatically: set `iterate.afterRelease` in `factory.config.json` to `manual` (default), `plan` or `auto`.
+Auto mode stops itself when the planner judges the product converged, after 2 consecutive iterations with blocked tasks, or at `maxIterations`.
+Requires the initial build to be finished (no open non-iteration tasks).
 
 ## How the golden rules are enforced (not just requested)
 - Rules are injected into every agent prompt.
