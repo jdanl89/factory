@@ -11,7 +11,7 @@ import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
 import { runQualityGates, detectProfile, ensureCiWorkflow, ensureEditorConfig, ensureDependabot } from './lib/quality.mjs';
 import { ensureDeps, ensureNodeProject, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
 import { scout, toolsList, toolsDecide } from './lib/scout.mjs';
-import { gatherSignals, loadFreshResearch, saveResearch, deepRead, sourceText, verifyQuotes, marketCheck } from './lib/research.mjs';
+import { gatherSignals, loadFreshResearch, saveResearch, deepRead, sourceText, verifyQuotes, marketCheck, opportunityScore } from './lib/research.mjs';
 
 const RULES = () => `GOLDEN RULES:\n${rulesText()}\n\n${principles()}\n${platformText()}\n${preferredText()}`;
 const read = (f) => fs.readFileSync(f, 'utf8');
@@ -25,10 +25,11 @@ async function research(force = false) {
   const signals = await gatherSignals();
   log('research', { msg: `${signals.length} signals gathered` });
   if (signals.length < 8) throw new Error('too few research signals (network blocked?); refusing to invent demand');
-  const digest = signals.map((s, i) => `${i + 1}. [${s.source}] ${s.title} | ${s.text} | score ${s.score}, ${s.comments} comments | ${s.url}`).join('\n');
+  const digest = signals.map((s, i) => `${i + 1}. [${s.source}${s.lens ? ' | lens: ' + s.lens : ''}] ${s.title} | ${s.text} | score ${s.score}, ${s.comments} comments | ${s.url}`).join('\n');
   const out = await chatJson('analyst', persona('analyst') + '\n\n' + RULES(), `Signals:\n${digest}`);
   const known = new Set(signals.map((s) => s.url));
-  const opps = (out.opportunities || []).map((o) => ({ ...o, evidence: (o.evidence || []).filter((u) => known.has(u)) })).filter((o) => o.evidence.length);
+  const opps = (out.opportunities || []).map((o) => ({ ...o, evidence: (o.evidence || []).filter((u) => known.has(u)), total: opportunityScore(o) })).filter((o) => o.evidence.length)
+    .sort((a, b) => b.total - a.total);
   if (!opps.length) throw new Error('analyst returned no evidence-backed opportunities');
   const res = { at: new Date().toISOString(), signals, opportunities: opps };
   saveResearch(res);
@@ -48,7 +49,7 @@ async function buildBriefs(r) {
     if (!sources.length) { log('ideate', { msg: `skip "${o.saas_concept}": no readable source text` }); continue; }
     const text = sources.map((d, i) => `SOURCE ${i + 1} (${d.host}) ${d.url}\n${sourceText(d)}`).join('\n\n').slice(0, 11000);
     let b;
-    try { b = await chatJson('analyst', persona('needs') + '\n\n' + RULES(), `Analyst's first-pass concept (may be wrong; trust the sources over it): ${o.saas_concept}\n\n${text}`); }
+    try { b = await chatJson('analyst', persona('needs') + '\n\n' + RULES(), `Analyst's first-pass concept (may be wrong; trust the sources over it): ${o.saas_concept}\nEvidence lenses: ${(o.lenses || []).join(", ") || "general"}. Sources may be a discussion, a revenue/launch post, a shutdown or repricing story, or a trending project README; for those, quote the text that shows the demand, payment or gap.\n\n${text}`); }
     catch (e) { log('ideate', { msg: `needs analysis failed: ${e.message}` }); continue; }
     b.user_quotes = verifyQuotes(b.user_quotes, sources.map(sourceText));
     if (!b.user_quotes.length) { log('ideate', { msg: `drop "${o.saas_concept}": no verifiable user quotes` }); continue; }
@@ -724,7 +725,7 @@ async function modelsStatus(testRole) {
 
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const cmds = {
-  research: () => research(true).then((r) => r.opportunities.forEach((o) => console.log(`- [${o.demand_strength}] ${o.saas_concept}\n    ${o.evidence.join(' ')}`))),
+  research: () => research(true).then((r) => r.opportunities.forEach((o) => console.log(`- [${o.demand_strength}, score ${o.total ?? "?"}, ${(o.lenses || []).join("+") || "general"}] ${o.saas_concept}\n    ${o.evidence.join(' ')}`))),
   ideate: () => ideate(arg ? [arg, ...rest].join(' ') : ''),
   plan: () => plan(arg), build: () => build(arg), release: () => release(arg),
   cycle: () => cycle(arg ? [arg, ...rest].join(' ') : ''), loop, status,

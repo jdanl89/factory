@@ -24,11 +24,40 @@ const HN_QUERIES = [
   'how do you manage', 'tired of', 'would pay for', 'spreadsheet hell', 'small business software',
   'freelancers tool', 'what do you use for', 'too expensive', 'built my own tool because',
 ];
-const SE_SITES = ['softwarerecs', 'webapps', 'pm', 'money', 'ux', 'webmasters', 'softwareengineering', 'workplace', 'expatriates', 'photo', 'diy', 'law'];
+const SE_SITES = ['softwarerecs', 'webapps', 'pm', 'money', 'ux', 'webmasters', 'softwareengineering', 'workplace', 'expatriates', 'photo', 'diy', 'law', 'startups', 'academia', 'fitness', 'gardening', 'mechanics'];
 // Sites mostly about non-developer problems; sampled more often to counter the developer-heavy bias.
-const SE_NON_DEV = new Set(['webapps', 'pm', 'money', 'workplace', 'photo', 'diy', 'law']);
+const SE_NON_DEV = new Set(['webapps', 'pm', 'money', 'workplace', 'photo', 'diy', 'law', 'startups', 'academia', 'fitness', 'gardening', 'mechanics']);
 
 const pick = (arr, n) => [...arr].sort(() => Math.random() - 0.5).slice(0, n);
+
+// ---- ideation lenses: each produces signals tagged with WHY they matter ----
+const monthsAgo = (m) => Math.floor(Date.now() / 1000) - m * 30 * 86400;
+const PAYING_QUERIES = ['MRR', 'monthly recurring revenue', 'paying customers', 'made $ per month', 'first paying customer', 'bootstrapped', 'revenue'];
+const GAP_QUERIES = ['is shutting down', 'sunsetting', 'raising prices', 'price hike', 'alternative to', 'self-hosted alternative', 'open source alternative', 'is being discontinued'];
+const hnHit = (lens) => (h) => ({ source: 'hackernews', lens, title: clean(h.title, 160), text: clean(h.story_text || h.url, 320), score: h.points ?? 0, comments: h.num_comments ?? 0, url: `https://news.ycombinator.com/item?id=${h.objectID}` });
+
+export async function lensSignals() {
+  const out = [];
+  for (const q of pick(PAYING_QUERIES, 3)) {
+    out.push(...await safe('paying ' + q, async () => {
+      const j = await getJson(`https://hn.algolia.com/api/v1/search?query=${encodeURIComponent('"' + q + '"')}&tags=show_hn&numericFilters=${encodeURIComponent(`created_at_i>${monthsAgo(18)},points>=15`)}&hitsPerPage=8`);
+      return j.hits.map(hnHit('paying'));
+    }));
+  }
+  for (const q of pick(GAP_QUERIES, 3)) {
+    out.push(...await safe('gap ' + q, async () => {
+      const j = await getJson(`https://hn.algolia.com/api/v1/search?query=${encodeURIComponent('"' + q + '"')}&tags=story&numericFilters=${encodeURIComponent(`created_at_i>${monthsAgo(18)},points>=60,num_comments>=25`)}&hitsPerPage=8`);
+      return j.hits.map(hnHit('gap'));
+    }));
+  }
+  // Trends: brand-new repositories that gained stars fastest across all topics, i.e. what builders and users are flocking to.
+  out.push(...await safe('trend repos', async () => {
+    const since = new Date(Date.now() - 90 * 86400e3).toISOString().slice(0, 10);
+    const j = await getJson(`https://api.github.com/search/repositories?q=${encodeURIComponent('created:>' + since + ' stars:>300')}&sort=stars&per_page=15`);
+    return (j.items || []).map((r) => ({ source: 'github-trending', lens: 'trend', title: clean(r.full_name + ': ' + (r.description || ''), 160), text: (r.topics || []).join(', '), score: r.stargazers_count, comments: r.forks_count, url: r.html_url }));
+  }));
+  return out;
+}
 
 // ---- Reddit: official app-only OAuth (read-only). Needs human-provided credentials in secrets/reddit.json ----
 const REDDIT_SUBS = ['SomebodyMakeThis', 'AppIdeas', 'SaaS', 'microsaas', 'smallbusiness', 'freelance', 'Entrepreneur', 'sysadmin', 'webdev', 'selfhosted'];
@@ -89,7 +118,7 @@ export async function gatherSignals() {
     signals.push(...await safe('stackexchange ' + site, async () => {
       const u = `https://api.stackexchange.com/2.3/questions?order=desc&sort=votes&site=${site}&fromdate=${yearAgo()}&pagesize=10&filter=default`;
       const j = await getJson(u);
-      return (j.items || []).map((i) => ({ source: 'stackexchange:' + site, title: clean(i.title, 160), text: (i.tags || []).join(', '), score: i.score, comments: i.answer_count, url: i.link }));
+      return (j.items || []).map((i) => ({ source: 'stackexchange:' + site, lens: SE_NON_DEV.has(site) ? 'nondev' : undefined, title: clean(i.title, 160), text: (i.tags || []).join(', '), score: i.score, comments: i.answer_count, url: i.link }));
     }));
   }
   signals.push(...await safe('github', async () => {
@@ -110,6 +139,7 @@ export async function gatherSignals() {
     return j.map((a) => ({ source: 'devto', title: clean(a.title, 160), text: clean(a.description, 200), score: a.positive_reactions_count ?? 0, comments: a.comments_count ?? 0, url: a.url }));
   }));
   signals.push(...await safe('reddit', redditSignals));
+  signals.push(...await lensSignals());
   const seen = new Set();
   const uniq = signals.filter((s) => s.title && !seen.has(s.url) && seen.add(s.url));
   // Round-robin across source groups (best-scoring first within each) so no single source dominates.
@@ -120,7 +150,7 @@ export async function gatherSignals() {
     groups.get(g).push(s);
   }
   const out = [];
-  while (out.length < 60 && [...groups.values()].some((g) => g.length)) for (const g of groups.values()) if (g.length && out.length < 60) out.push(g.shift());
+  while (out.length < 80 && [...groups.values()].some((g) => g.length)) for (const g of groups.values()) if (g.length && out.length < 80) out.push(g.shift());
   return out;
 }
 
@@ -130,6 +160,7 @@ export function parseSource(url) {
   try { u = new URL(url); } catch { return null; }
   let m;
   if (u.hostname === 'github.com' && (m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/(issues|pull|discussions)\/(\d+)/)) && m[3] === 'issues') return { kind: 'github', owner: m[1], repo: m[2], n: m[4] };
+  if (u.hostname === 'github.com' && (m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/?$/))) return { kind: 'repo', owner: m[1], repo: m[2] };
   if (u.hostname === 'news.ycombinator.com' && (m = u.searchParams.get('id'))) return { kind: 'hn', id: m };
   if (/\.stackexchange\.com$/.test(u.hostname) && (m = u.pathname.match(/^\/questions\/(\d+)/))) return { kind: 'se', site: u.hostname, id: m[1] };
   return null;
@@ -146,6 +177,12 @@ export async function deepRead(url) {
       const ranked = [...cs].sort((a, b) => (b.reactions?.total_count ?? 0) - (a.reactions?.total_count ?? 0));
       const picked = [...new Set([...cs.slice(0, 6), ...ranked.slice(0, 6)])].slice(0, 12);
       return { url, host: `github.com/${src.owner}/${src.repo}`, title: tidy(issue.title, 200), body: tidy(issue.body, 3000), comments: picked.map((c) => tidy(c.body, 600)) };
+    }
+    if (src.kind === 'repo') {
+      const r = await getJson(`https://api.github.com/repos/${src.owner}/${src.repo}`);
+      const rd = await getJson(`https://api.github.com/repos/${src.owner}/${src.repo}/readme`).catch(() => null);
+      const readme = rd?.content ? Buffer.from(rd.content, 'base64').toString('utf8') : '';
+      return { url, host: `github.com/${src.owner}/${src.repo}`, title: tidy(`${r.full_name}: ${r.description || ''}`, 200), body: tidy(readme, 3000), comments: [] };
     }
     if (src.kind === 'hn') {
       const j = await getJson(`https://hn.algolia.com/api/v1/items/${src.id}`);
@@ -170,6 +207,15 @@ export function verifyQuotes(quotes, texts) {
   const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
   const hay = texts.map(norm);
   return (quotes || []).map(String).filter((q) => norm(q).length >= 12 && hay.some((h) => h.includes(norm(q))));
+}
+
+// Weighted, bounded score so one inflated number cannot dominate; a second independent lens earns a bonus.
+export function opportunityScore(o) {
+  const s = o.scores || {};
+  const n = (k) => Math.min(5, Math.max(1, Number(s[k]) || 1));
+  const lenses = new Set((o.lenses || []).filter((l) => ['paying', 'gap', 'nondev', 'trend'].includes(l)));
+  const base = n('pain') * 2 + n('payment') * 3 + n('gap') * 2 + n('timing') + n('buildability') * 1.5;
+  return Math.round((base + Math.min(3, lenses.size - 1 > 0 ? (lenses.size - 1) * 2 : 0) + (o.evidence?.length > 1 ? 1 : 0)) * 10) / 10;
 }
 
 // ---- market check: what already exists (npm packages, GitHub repositories) ----

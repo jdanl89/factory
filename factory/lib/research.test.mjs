@@ -36,3 +36,16 @@ test('deepRead and marketCheck use fetched data', async () => {
     assert.deepEqual(m.map((x) => x.source), ['npm', 'github']);
   } finally { globalThis.fetch = real; }
 });
+
+test('opportunityScore is bounded and rewards independent lenses', async () => {
+  const { opportunityScore } = await import('./research.mjs');
+  const one = opportunityScore({ scores: { pain: 3, payment: 3, gap: 3, timing: 3, buildability: 3 }, lenses: ['paying'], evidence: ['a'] });
+  const two = opportunityScore({ scores: { pain: 3, payment: 3, gap: 3, timing: 3, buildability: 3 }, lenses: ['paying', 'gap'], evidence: ['a', 'b'] });
+  assert.ok(two > one);
+  assert.ok(opportunityScore({ scores: { pain: 99, payment: 99, gap: 99, timing: 99, buildability: 99 }, lenses: ['a', 'paying', 'gap', 'trend', 'nondev'], evidence: ['a', 'b'] }) <= 5 * 9.5 + 4);
+  assert.ok(opportunityScore({}) >= 9.5);
+});
+
+test('parseSource handles repositories', () => {
+  assert.deepEqual(parseSource('https://github.com/a/b'), { kind: 'repo', owner: 'a', repo: 'b' });
+});

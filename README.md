@@ -8,7 +8,7 @@ review it, and package it for **you** to publish. You own `GOLDEN_RULES.md` and 
 
 | Stage | Who (Ollama model) | Tool | Output |
 |---|---|---|---|
-| ideate | deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) → strategist → **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) → compliance + regex denylist | – | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
+| ideate | multi-lens research (paying demand, market gaps, non-developer pain, trends) scored by the analyst, then deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) → strategist → **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) → compliance + regex denylist | – | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
 | architecture + plan | architect, then PM (configured Ollama models) | **OpenSpec** (`openspec/changes/<slug>`, validated) + **backlog.md** tasks | production proposal + spec + tasks |
 | build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks → Done |
 | release | release writer | – | README + `approvals/*-publish.md` |
