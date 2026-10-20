@@ -8,10 +8,20 @@ review it, and package it for **you** to publish. You own `GOLDEN_RULES.md` and 
 
 | Stage | Who (Ollama model) | Tool | Output |
 |---|---|---|---|
-| ideate | strategist (qwen3:8b) + compliance (qwen3:8b) + regex denylist | – | `ideas/<slug>.json` |
-| plan | pm (qwen3:8b) | **OpenSpec** (`openspec/changes/<slug>`, validated) + **backlog.md** tasks | spec + tasks |
-| build | engineer (qwen2.5-coder:14b), reviewer (qwen3:8b) | `node --test` gate, code guard | `products/<slug>` (own git repo), tasks → Done |
+| ideate | strategist + compliance (Ollama models in `factory.config.json`) + regex denylist | – | `ideas/<slug>.json` |
+| architecture + plan | architect, then PM (configured Ollama models) | **OpenSpec** (`openspec/changes/<slug>`, validated) + **backlog.md** tasks | production proposal + spec + tasks |
+| build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks → Done |
 | release | release writer | – | README + `approvals/*-publish.md` |
+
+## Architecture and supported engineering stacks
+Every product receives a production-architecture proposal before planning. The architect compares plausible deployment models and services for the actual workload, including compute/runtime, API ingress, persistence, storage, identity/secrets, networking, observability, IaC, and checks-only CI. For relevant AWS APIs it considers Lambda + API Gateway, ECS/Fargate, Elastic Beanstalk, RDS, and DynamoDB rather than selecting services by habit. The chosen runtime and managed services determine the framework and language; the proposal and its assumptions are saved with the idea, OpenSpec change, and human approval request.
+
+Supported profiles are React or Angular with TypeScript, Node.js with Express/Fastify/NestJS, ASP.NET Core on supported .NET, and Terraform or OpenTofu when infrastructure is in scope. Layers are selected by product need, not forced. The architecture is a proposal only: no cloud resource, account, paid service, deployment, or IaC apply is authorized by it.
+
+## Quality gates and DevSecOps
+The factory detects the product stack and runs its applicable local checks: tests, lint/format/type checks, frontend build and Playwright for browser apps, integration tests for services, npm/.NET dependency vulnerability checks, secret scanning, and IaC format/init/validate/security scans. Missing optional tools are recorded as skipped during task work; required release checks fail closed. npm, NuGet, and IaC lockfiles are required for reproducible release checks. A generated `.github/workflows/ci.yml` is checks-only with read-only repository permissions; existing workflows are not overwritten, but are checked against the stack's policy.
+
+Release validation may require local `Semgrep` for SAST, `Trivy` for IaC security scans, and the matching `dotnet`, `terraform`, or `tofu` CLI for the product stack. Browser projects need Playwright and its Chromium browser installed. Install these tools through their official distribution channels; the factory does not install or run third-party tools on your behalf. CI can download its declared check tools, but never deploys, applies infrastructure, references secrets, or invokes paid services.
 
 Process discipline from **obra/superpowers** is vendored in `vendor/superpowers` (TDD, verification-before-completion,
 systematic-debugging, writing-plans, code review skills). The personas in `agents/` encode the same principles
@@ -33,9 +43,11 @@ npx openspec list        # spec changes
 ```
 Logs: `factory/state/ledger.jsonl`.
 
+
 ## Reuse over reinvention, and tool scouting
-- Products are built on standard npm packages (express, zod, bcryptjs, jose, helmet, openid-client, ... see `dependencies.preferred` in `factory.config.json`), not custom auth/crypto/validation code. Principles live in `agents/_principles.md` and are injected into every agent prompt.
-- Engineers declare packages on a `DEPENDENCIES: a, b` line. The factory vets each one (registry lookup: license, deprecation, last release, weekly downloads, no install scripts/native builds), installs it with `--ignore-scripts`, rejects packages with high/critical `npm audit` findings, and rejects imports of undeclared packages. Agents never edit `package.json`.
+- Products use standard frameworks and libraries (see `platforms` and `dependencies.preferred` in `factory.config.json`), not custom auth/crypto/validation code. Principles live in `agents/_principles.md` and are injected into every agent prompt.
+- For Node/TypeScript, engineers declare packages on a `DEPENDENCIES: a, b` line. The factory vets each one (registry lookup: license, deprecation, last release, weekly downloads, no install scripts/native builds), installs it with `--ignore-scripts`, rejects packages with high/critical `npm audit` findings, and rejects imports of undeclared packages. Agents never edit `package.json`.
+- .NET package references and Terraform/OpenTofu providers must be versioned and locked; release gates run NuGet vulnerability checks and IaC provider validation/scanning. External service integrations remain inactive until the named service and spend are human-approved and configured.
 - Reviewer fails hand-rolled security code; evaluator reports `reinvented_wheels`; iteration planner schedules replacing them first.
 - `node factory/cli.mjs scout` (also runs weekly inside `cycle`) searches the MCP registry, npm and GitHub for MCP servers/skills/tools and writes `tooling/catalog.json`. `tools` lists it; `tools-approve <id>` / `tools-reject <id>` decide. Approved skills (markdown, scanned, <20KB) are injected into the chosen roles' prompts (`skills/approved/`); approved MCP servers are listed in `tooling/approved-for-human-install.md` for you to add to your own Copilot/Claude setup (the factory orchestrator does not run MCP servers).
 
@@ -68,9 +80,7 @@ Requires the initial build to be finished (no open non-iteration tasks).
 - `HALT` file stops everything; per-day cycle cap.
 
 ## Honest limits
-- 7–14B local models on a 6 GB GTX 1060 build small, simple tools; expect some tasks to end up `blocked`
-  (see `approvals/*-blocked-task.md`). Improve by changing `models.engineer` in `factory.config.json`
-  (e.g. to a larger/hosted model, which is a spend decision needing your approval).
+- Local models and available hardware affect speed and task success; larger models may take substantially longer. The factory can split and rescope blocked work, but still records a blocker rather than claiming success if it cannot complete a check or task.
 - Revenue needs you: creating a store/payment account, publishing, and support are human-only by rule 6.
   The factory prepares everything and lists exact steps in `approvals/`.
 - **squad-cli** is installed (`npx squad`) but is a GitHub Copilot–based multi-agent runtime; it isn't wired

@@ -53,11 +53,18 @@ export function safeJoin(base, rel) {
 const CODE_BAD = [/\bchild_process\b/, /\bfetch\s*\(/, /\bhttps?\.(get|request)\s*\(/, /\bnode:(net|dgram|tls)\b/, /process\.env\.[A-Z_]*(KEY|TOKEN|SECRET|PASSWORD)/i, /\b(src|href)\s*=\s*["']https?:\/\/(?!127\.0\.0\.1|localhost)/i, /\bsrc\s*=\s*["']\/\//i];
 export function codeViolations(rel, content) {
   const r = rel.replace(/\\/g, '/');
-  if (!/\.(mjs|js|cjs|html)$/.test(r) || /(^|\/)test\//.test(r)) return [];
-  const browser = /^public\//.test(r);
+  const ext = path.extname(r).toLowerCase();
+  if (!/\.(mjs|js|cjs|jsx|ts|tsx|html|cs)$/.test(r) || /(^|\/)(test|tests)\//.test(r)) return [];
+  const browser = /^public\//.test(r) || ['.jsx', '.tsx'].includes(ext);
   const bad = CODE_BAD.filter((x) => !(browser && x.source.startsWith('\\bfetch')));
   const v = bad.filter((x) => x.test(content)).map((x) => `${rel}: forbidden pattern ${x}`);
   if (browser && /\bfetch\s*\(\s*[`"']?(https?:)?\/\//.test(content)) v.push(`${rel}: fetch to external origin`);
+  if (ext === '.cs') {
+    if (/\b(?:Process\.Start|ProcessStartInfo)\b/.test(content)) v.push(`${rel}: product code cannot launch processes`);
+    if (/\b(?:HttpClient|WebClient|SocketsHttpHandler)\b/.test(content)) v.push(`${rel}: product code cannot make outbound network calls`);
+    if (/\bEnvironment\.GetEnvironmentVariable\s*\(\s*["'][^"']*(?:KEY|TOKEN|SECRET|PASSWORD)/i.test(content)) v.push(`${rel}: product code cannot read credential environment variables`);
+  }
+  if (/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{30,}\b/.test(content)) v.push(`${rel}: possible hard-coded secret`);
   return v;
 }
 
@@ -73,7 +80,13 @@ function skillsFor(role) {
   }
   return out.length ? '\n\n' + out.join('\n\n') : '';
 }
-export const principles = () => fs.readFileSync(p('agents', '_principles.md'), 'utf8');
+export const principles = () => ['_principles.md', '_standards.md'].map((f) => fs.readFileSync(p('agents', f), 'utf8')).join('\n\n');
+export const platformText = () => {
+  const p = cfg.platforms || {};
+  return `SUPPORTED STACKS (choose the smallest mainstream fit; do not force every layer):\n` +
+    `Frontend: ${(p.frontend || []).join(', ')}\nBackend: ${(p.backend || []).join(', ')}\nInfrastructure as code: ${(p.iac || []).join(', ')}\n` +
+    `Cloud targets: ${(p.cloud || []).join(', ')}\nTesting: ${(p.testing || []).join(', ')}\nSelection must be explicit in the idea as tech_stack {frontend, backend, iac}; use \"none\" where a layer is not needed. Production architecture and services must be decided before framework/language; it is a proposal only until human spend approval.`;
+};
 
 // ---- ollama ----
 export async function chat(role, system, user, { json = false, temperature = 0.4 } = {}) {

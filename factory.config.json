@@ -2,6 +2,7 @@
   "ollama": { "host": "http://127.0.0.1:11434", "keepAlive": "10m", "timeoutMs": 7200000 },
   "models": {
     "strategist": "qwen3-coder:30b",
+    "architect": "qwen3-coder:30b",
     "compliance": "qwen3:8b",
     "pm": "qwen3-coder:30b",
     "engineer": "qwen2.5-coder:14b",
@@ -14,6 +15,22 @@
     "reviewer": "qwen3:8b"
   },
   "contextTokens": 16384,
+  "platforms": {
+    "frontend": ["React + TypeScript + Vite", "Angular + TypeScript"],
+    "backend": ["Node.js LTS + TypeScript + Express/Fastify/NestJS", ".NET LTS + ASP.NET Core"],
+    "cloud": ["AWS", "Azure", "GCP", "self-hosted", "local-only"],
+    "iac": ["Terraform", "OpenTofu"],
+    "testing": ["unit tests", "integration tests", "Playwright end-to-end tests", "accessibility checks"],
+    "ci": ["GitHub Actions checks-only workflows"]
+  },
+  "quality": {
+    "requireCiWorkflow": true,
+    "requirePlaywrightForBrowserApps": true,
+    "requireIntegrationTestsForServices": true,
+    "requireDependencyLockfiles": true,
+    "blockHighOrCriticalVulnerabilities": true,
+    "allowDeployInCi": false
+  },
   "build": { "attemptsSmall": 2, "attemptsLarge": 2, "maxSplitDepth": 2, "testTimeoutMs": 60000, "maxTasksPerCycle": 40 },
   "loop": { "maxCyclesPerDay": 4, "sleepMinutes": 30 },
   "iterate": { "afterRelease": "manual", "maxIterations": 25, "maxTasksPerIteration": 8, "convergeScore": 9 },

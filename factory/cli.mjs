@@ -3,15 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  ROOT, cfg, rulesText, principles, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
+  ROOT, cfg, rulesText, principles, platformText, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
   chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman, setScope, stopFile,
 } from './lib/core.mjs';
 import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
-import { ensureDeps, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
+import { runQualityGates, detectProfile, ensureCiWorkflow, ensureEditorConfig, ensureDependabot } from './lib/quality.mjs';
+import { ensureDeps, ensureNodeProject, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
 import { scout, toolsList, toolsDecide } from './lib/scout.mjs';
 import { gatherSignals, loadFreshResearch, saveResearch } from './lib/research.mjs';
 
-const RULES = () => `GOLDEN RULES:\n${rulesText()}\n\n${principles()}\n${preferredText()}`;
+const RULES = () => `GOLDEN RULES:\n${rulesText()}\n\n${principles()}\n${platformText()}\n${preferredText()}`;
 const read = (f) => fs.readFileSync(f, 'utf8');
 const exists = fs.existsSync;
 
@@ -55,13 +56,112 @@ async function ideate(hint = '') {
 }
 
 // ---------- 2. PLAN (OpenSpec + backlog.md) ----------
+function architectureMarkdown(a) {
+  const alternatives = (a.alternatives || []).map((x) => `### ${x.option}\nPros: ${(x.pros || []).join('; ')}\nCons: ${(x.cons || []).join('; ')}\nWhy not selected: ${x.why_not_selected || 'Not selected'}\n`).join('\n');
+  const cost = a.cost || {};
+  return `# Production architecture proposal\n\n**Status: proposal only. No account, resource, deployment, or paid service has been activated.**\n\n` +
+    `## Decision\nProvider: ${a.provider}\nDeployment model: ${a.deployment_model}\n\n${a.decision}\n\n` +
+    `## Framework and language\n${JSON.stringify(a.tech_stack, null, 2)}\n\n## Production components\n${Object.entries(a.components || {}).map(([k, v]) => `- ${k}: ${v}`).join('\n')}\n\n` +
+    `## Request and data flow\n${(a.request_and_data_flow || []).map((x, i) => `${i + 1}. ${x}`).join('\n')}\n\n` +
+    `## Alternatives considered\n${alternatives || 'No alternatives supplied.'}\n## Assumptions\n${(a.assumptions || []).map((x) => `- ${x}`).join('\n')}\n\n` +
+    `## Security and reliability\n${(a.security_and_reliability || []).map((x) => `- ${x}`).join('\n')}\n\n` +
+    `## Cost\nEstimate status: ${cost.estimate_status || 'not_assessed'}\nMonthly USD: ${cost.monthly_usd_min ?? 'not estimated'} - ${cost.monthly_usd_max ?? 'not estimated'}\n` +
+    `Assumptions: ${(cost.assumptions || []).join('; ') || 'none supplied'}\nOfficial sources: ${(cost.official_sources || []).join(', ') || 'none supplied'}\n\n` +
+    `## Human approval required before spending\n${(a.human_approval_required || []).map((x) => `- ${x}`).join('\n') || '- Any paid resource, deployment, account, or external service.'}\n`;
+}
+
+async function designArchitecture(slug, idea) {
+  const prompt = `Design a production architecture BEFORE selecting implementation frameworks. Product idea:\n${JSON.stringify(idea, null, 2)}\n\n` +
+    `Select cloud provider and concrete managed services (or local-only/self-hosted if justified). Compare alternatives; state runtime, API ingress, database, object storage, identity/secrets, networking, observability, IaC and checks-only CI. ` +
+    `For AWS REST APIs, explicitly assess Lambda+API Gateway vs ECS/Fargate vs Elastic Beanstalk and RDS vs DynamoDB as relevant. ` +
+    `Do not invent cost figures; numeric estimates need official public pricing sources and explicit workload assumptions. This is a proposal only: no accounts, paid APIs, provisioning, deploy, or spend.`;
+  const architecture = await chatJson('architect', persona('architect') + '\n\n' + RULES(), prompt);
+  if (!architecture || typeof architecture !== 'object' || Array.isArray(architecture)) throw new Error('architect returned an invalid architecture object');
+  const problems = [];
+  if (!['AWS', 'Azure', 'GCP', 'self-hosted', 'local-only'].includes(architecture.provider)) problems.push('choose a supported provider');
+  if (!architecture.decision || typeof architecture.decision !== 'string') problems.push('missing architecture decision and rationale');
+  if (typeof architecture.deployment_model !== 'string' || !architecture.deployment_model.trim()) problems.push('missing deployment model');
+  const stack = architecture.tech_stack || {};
+  if (typeof stack.frontend !== 'string' || !/^(none|react(?:\s|$)|angular(?:\s|$))/i.test(stack.frontend)) problems.push('tech_stack.frontend must choose React, Angular, or none');
+  if (typeof stack.backend !== 'string' || !/^(none|node(?:\.js)?\b.*\b(express|fastify|nestjs)\b|\.net\b.*asp\.net core)/i.test(stack.backend)) problems.push('tech_stack.backend must choose Node.js with Express/Fastify/NestJS, ASP.NET Core, or none');
+  if (typeof stack.iac !== 'string' || !/^(none|terraform|opentofu)$/i.test(stack.iac)) problems.push('tech_stack.iac must choose Terraform, OpenTofu, or none');
+  if (!architecture.components || typeof architecture.components !== 'object') problems.push('missing production components');
+  else for (const field of ['compute', 'api_gateway', 'database', 'object_storage', 'cache_queue', 'identity_secrets', 'networking', 'observability', 'ci_cd']) {
+    if (typeof architecture.components[field] !== 'string' || !architecture.components[field].trim()) problems.push(`missing architecture component: ${field}`);
+  }
+  if (!Array.isArray(architecture.request_and_data_flow) || !architecture.request_and_data_flow.length) problems.push('missing concrete request and data flow');
+  if (!Array.isArray(architecture.alternatives) || !architecture.alternatives.length) problems.push('compare at least one viable alternative');
+  if (!Array.isArray(architecture.assumptions) || !architecture.assumptions.length) problems.push('record workload and operational assumptions');
+  if (!Array.isArray(architecture.security_and_reliability) || !architecture.security_and_reliability.length) problems.push('record security and reliability controls');
+  if (!Array.isArray(architecture.human_approval_required) || !architecture.human_approval_required.length) problems.push('list human approvals needed before activation');
+  if (!architecture.cost || typeof architecture.cost !== 'object' || Array.isArray(architecture.cost)) {
+    problems.push('cost must be an object');
+    architecture.cost = {};
+  }
+  architecture.cost.assumptions = Array.isArray(architecture.cost.assumptions) ? architecture.cost.assumptions : [];
+  architecture.cost.official_sources = Array.isArray(architecture.cost.official_sources) ? architecture.cost.official_sources : [];
+  if (!['not_assessed', 'sourced_estimate'].includes(architecture.cost?.estimate_status)) problems.push('set a valid cost estimate status');
+  if (architecture.cost?.estimate_status === 'sourced_estimate') {
+    const { monthly_usd_min: min, monthly_usd_max: max } = architecture.cost;
+    const validRange = Number.isFinite(min) && Number.isFinite(max) && min >= 0 && max >= min;
+    const officialHosts = {
+      AWS: ['aws.amazon.com', 'calculator.aws'],
+      Azure: ['azure.microsoft.com', 'learn.microsoft.com'],
+      GCP: ['cloud.google.com'],
+    }[architecture.provider] || [];
+    const officialSources = architecture.cost.official_sources.length > 0 && architecture.cost.official_sources.every((source) => {
+      try {
+        const url = new URL(source);
+        return url.protocol === 'https:' && officialHosts.some((host) => url.hostname === host || url.hostname.endsWith('.' + host));
+      } catch { return false; }
+    });
+    if (!validRange || !Array.isArray(architecture.cost.official_sources) || !architecture.cost.official_sources.length ||
+      !officialSources || !Array.isArray(architecture.cost.assumptions) || !architecture.cost.assumptions.length) {
+      architecture.cost.monthly_usd_min = null;
+      architecture.cost.monthly_usd_max = null;
+      architecture.cost.estimate_status = 'not_assessed';
+      architecture.cost.assumptions = [...architecture.cost.assumptions, 'Unverified price figures removed; obtain human-reviewed estimate from official pricing sources.'];
+    }
+  } else {
+    architecture.cost ||= {};
+    architecture.cost.monthly_usd_min = null;
+    architecture.cost.monthly_usd_max = null;
+  }
+  if (problems.length) throw new Error(`incomplete production architecture: ${problems.join('; ')}`);
+  const verdict = await chatJson('compliance', persona('compliance') + '\n\n' + RULES(),
+    JSON.stringify({ product: idea.title, golden_rules: rulesText(), production_architecture: architecture, instruction: 'Review for compliance only; this proposal does not authorize spend or deployment.' }));
+  if (!verdict.approved) {
+    requestHuman('architecture-compliance', slug, [`Proposed architecture rejected: ${(verdict.violations || []).join('; ')}`, 'See the generated architecture object in ideas/' + slug + '.json after approval or request a revised plan.']);
+    throw new Error(`production architecture failed compliance: ${(verdict.violations || []).join('; ')}`);
+  }
+  architecture.compliance = verdict;
+  idea.production_architecture = architecture;
+  idea.tech_stack = architecture.tech_stack;
+  idea.architecture_status = 'proposed-human-approval-required-before-any-spend';
+  fs.writeFileSync(path.join(paths.ideas, slug + '.json'), JSON.stringify(idea, null, 2));
+  requestHuman('production-architecture', slug, [
+    `Production proposal: ${architecture.provider} / ${architecture.deployment_model}`,
+    architecture.decision,
+    `Components: ${JSON.stringify(architecture.components)}`,
+    `Cost estimate: ${architecture.cost?.estimate_status || 'not_assessed'}; monthly USD ${architecture.cost?.monthly_usd_min ?? 'not estimated'} - ${architecture.cost?.monthly_usd_max ?? 'not estimated'}.`,
+    `Official pricing sources: ${(architecture.cost?.official_sources || []).join(', ') || 'none; request an estimate before use'}`,
+    `Approval required before spend: ${(architecture.human_approval_required || []).join('; ') || 'any paid service or deployment'}`,
+    'This approval request records the proposal only. It does not authorize provisioning or deployment.',
+  ]);
+  return architecture;
+}
+
 async function plan(slug) {
   haltCheck();
   const ideaFile = path.join(paths.ideas, slug + '.json');
   const idea = JSON.parse(read(ideaFile));
   if (idea.status !== 'approved') throw new Error('idea not approved');
+  const architecture = await designArchitecture(slug, idea);
+  idea.production_architecture = architecture;
+  idea.tech_stack = architecture.tech_stack;
   const pl = await chatJson('pm', persona('pm') + '\n\n' + RULES(), JSON.stringify(idea));
   if (!Array.isArray(pl.tasks) || !pl.tasks.length || !Array.isArray(pl.requirements)) throw new Error('bad plan shape');
+  pl.production_architecture = architecture;
   materialize(slug, pl, slug, []);
   idea.status = 'planned';
   fs.writeFileSync(ideaFile, JSON.stringify(idea, null, 2));
@@ -74,6 +174,7 @@ function materialize(slug, pl, changeName, extraLabels) {
   fs.mkdirSync(path.join(dir, 'specs', cap), { recursive: true });
   fs.writeFileSync(path.join(dir, 'proposal.md'), `## Why\n${pl.why}\n\n## What Changes\n${pl.what_changes}\n\n## Impact\n- Affected specs: ${cap}\n- Product: products/${slug}\n`);
   fs.writeFileSync(path.join(dir, 'design.md'), `## Design\n${pl.design}\n`);
+  if (pl.production_architecture) fs.writeFileSync(path.join(dir, 'production-architecture.md'), architectureMarkdown(pl.production_architecture));
   fs.writeFileSync(path.join(dir, 'tasks.md'), '## 1. Implementation\n' + pl.tasks.map((t, i) => `- [ ] 1.${i + 1} ${t.title}`).join('\n') + '\n');
   const specs = pl.requirements.map((r) => `### Requirement: ${r.name}\n${/\b(SHALL|MUST)\b/.test(r.text) ? r.text : 'The system SHALL ' + r.text}\n\n` +
     (r.scenarios?.length ? r.scenarios : [{ name: 'Basic', when: 'used normally', then: 'it works as described' }])
@@ -135,7 +236,7 @@ async function buildTask(slug, dir, task) {
   for (let attempt = 1; attempt <= ladder.length; attempt++) {
     haltCheck();
     const role = ladder[attempt - 1];
-    const prompt = `Product: ${idea.title}\n${idea.problem}\n${idea.human_constraints?.length ? 'HUMAN CONSTRAINTS (mandatory, override anything else):\n- ' + idea.human_constraints.join('\n- ') + '\n' : ''}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
+    const prompt = `Product: ${idea.title}\n${idea.problem}\nSelected tech stack: ${JSON.stringify(idea.tech_stack || {})}\nProduction architecture proposal (do not provision or deploy): ${JSON.stringify(idea.production_architecture || {})}\n${idea.human_constraints?.length ? 'HUMAN CONSTRAINTS (mandatory, override anything else):\n- ' + idea.human_constraints.join('\n- ') + '\n' : ''}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
     const reply = await chat(role, persona('engineer') + '\n\n' + RULES(), prompt, { temperature: 0.2 + attempt * 0.1 });
     const files = parseFiles(reply);
     if (!files.length) { feedback = '\nYour last reply had no parsable FILE blocks. Follow the output format exactly.'; continue; }
@@ -144,10 +245,21 @@ async function buildTask(slug, dir, task) {
     const problems = applyFiles(dir, files);
     if (depNote) problems.push(depNote);
     if (problems.length) { feedback = '\nRejected by guard, fix these:\n' + problems.join('\n'); log('guard', { slug, msg: problems.join(' | ') }); continue; }
-    const t = runTests(dir);
-    if (!t.ok) { feedback = `\nTests FAILED (attempt ${attempt}). Fix them:\n${t.out}`; log('tests-fail', { slug, msg: task.id + ' attempt ' + attempt }); continue; }
+    if (files.some((f) => /\.(?:mjs|cjs|js|jsx|ts|tsx)$/.test(f.rel)) || dep.added.length) {
+      try { ensureNodeProject(dir, slug); } catch (e) { feedback = `\nCould not create the locked npm project manifest: ${e.message}`; continue; }
+    }
+    const profile = detectProfile(dir, idea.tech_stack);
+    if (profile.supported) { ensureCiWorkflow(dir, profile); ensureEditorConfig(dir); ensureDependabot(dir, profile); }
+    const quality = await runQualityGates(dir, { stage: 'task', stackHint: idea.tech_stack });
+    const failedChecks = quality.checks.filter((c) => c.status === 'failed');
+    if (!quality.ok) {
+      feedback = `\nQuality gates FAILED (attempt ${attempt}). Fix all required failures:\n` + failedChecks.map((c) => `${c.name}: ${c.detail}`).join('\n');
+      log('quality-fail', { slug, msg: `${task.id}: ${failedChecks.map((c) => c.name).join(', ')}` });
+      continue;
+    }
+    const t = { ok: true, out: quality.checks.map((c) => `${c.status.toUpperCase()} ${c.name}: ${c.detail}`).join('\n') };
     const review = await chatJson('reviewer', persona('reviewer') + '\n\n' + RULES(),
-      `Task: ${task.title}\n${task.body}\n\nFiles:\n${snapshot(dir)}\n\nTest output:\n${t.out}`);
+      `Task: ${task.title}\n${task.body}\n\nSelected tech stack: ${JSON.stringify(idea.tech_stack || {})}\nProduction architecture: ${JSON.stringify(idea.production_architecture || {})}\nDetected stack: ${quality.profile.stacks.join(', ')}\nQuality-check evidence (never treat SKIPPED as passing):\n${t.out}\n\nFiles:\n${snapshot(dir)}`);
     if (review.verdict !== 'pass') { feedback = '\nReviewer rejected:\n- ' + (review.issues || []).join('\n- '); log('review-fail', { slug, msg: feedback.slice(0, 200) }); continue; }
     return { ok: true, summary: review.summary };
   }
@@ -162,8 +274,9 @@ const depthOf = (t) => Math.max(0, ...t.labels.map((l) => (l.match(/^depth-(\d+)
 // Ask the large model to rescope a failing task into smaller, independently testable subtasks.
 async function split(slug, dir, task, failure) {
   const depth = depthOf(task) + 1;
+  const idea = JSON.parse(read(path.join(paths.ideas, slug + '.json')));
   const out = await chatJson('planner', persona('splitter') + '\n\n' + RULES(),
-    `TASK ${task.id}: ${task.title}\n${task.body}\n\nWhy it failed:\n${failure}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}`);
+    `PRODUCT TECH STACK: ${JSON.stringify(idea.tech_stack || {})}\nPRODUCTION ARCHITECTURE: ${JSON.stringify(idea.production_architecture || {})}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nWhy it failed:\n${failure}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}`);
   const subs = (out.subtasks || []).slice(0, 4);
   if (subs.length < 2) return [];
   const ids = [];
@@ -232,13 +345,38 @@ async function build(slug, label) {
 async function release(slug) {
   const dir = path.join(paths.products, slug);
   const idea = JSON.parse(read(path.join(paths.ideas, slug + '.json')));
+  const profile = detectProfile(dir, idea.tech_stack);
+  if (profile.supported) { ensureCiWorkflow(dir, profile); ensureEditorConfig(dir); ensureDependabot(dir, profile); }
+  const quality = await runQualityGates(dir, { stage: 'release', stackHint: idea.tech_stack });
+  const failures = quality.checks.filter((c) => c.status === 'failed');
+  if (!quality.ok) {
+    log('release-blocked', { slug, msg: failures.map((c) => `${c.name}: ${c.detail}`).join(' | ') });
+    requestHuman('quality-gates', slug, [
+      'Release is blocked because required local quality gates failed or are unavailable.',
+      ...failures.map((c) => `FAIL ${c.name}: ${c.detail}`),
+      ...quality.checks.filter((c) => c.status === 'skipped').map((c) => `SKIPPED ${c.name}: ${c.detail}`),
+      'Install/configure required tools or fix failures, then retry: node factory/cli.mjs release ' + slug,
+    ]);
+    return false;
+  }
+  git(dir, 'add', '.github/workflows/ci.yml', '.github/dependabot.yml', '.editorconfig');
+  git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', 'ci: enforce local quality gates');
   const out = await chatJson('pm', persona('release') + '\n\n' + RULES(), `${JSON.stringify(idea)}\n\nFiles:\n${snapshot(dir)}`);
   const verdict = denylistHit(JSON.stringify(out));
   if (verdict) { log('release-blocked', { slug, msg: 'denylist ' + verdict }); return; }
   fs.writeFileSync(path.join(dir, 'README.md'), out.readme);
   git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', 'docs: README');
-  requestHuman('publish', slug, [`Listing copy: ${out.listing}`, `Pricing suggestion: ${out.pricing_suggestion}`, ...(out.human_steps || []).map((s) => 'HUMAN STEP: ' + s), `Product dir: products/${slug}`]);
+  requestHuman('publish', slug, [
+    `Listing copy: ${out.listing}`,
+    `Pricing suggestion: ${out.pricing_suggestion}`,
+    `Production architecture proposal: ${JSON.stringify(idea.production_architecture || {})}`,
+    'Architecture document: openspec/changes/' + slug + '/production-architecture.md',
+    'No cloud resources, deployment, paid APIs or publishing have been activated. Explicit written human approval is required before any spend or deployment.',
+    ...(out.human_steps || []).map((s) => 'HUMAN STEP: ' + s),
+    `Product dir: products/${slug}`,
+  ]);
   const idf = path.join(paths.ideas, slug + '.json'); const idea2 = JSON.parse(read(idf)); idea2.status = 'ready-for-human'; fs.writeFileSync(idf, JSON.stringify(idea2, null, 2));
+  return true;
 }
 
 // ---------- scrap: delete everything related to one idea/product ----------
@@ -321,7 +459,14 @@ function requireBuilt(slug) {
 async function evaluate(slug, n) {
   const dir = path.join(paths.products, slug);
   const idea = loadIdea(slug);
-  const mech = await mechanicalEval(dir);
+  const profile = detectProfile(dir, idea.tech_stack);
+  const quality = await runQualityGates(dir, { stage: 'release', stackHint: idea.tech_stack });
+  const hasNodeEntry = exists(path.join(dir, 'src', 'main.mjs'));
+  const mech = hasNodeEntry
+    ? await mechanicalEval(dir)
+    : { tests: { ok: quality.ok, out: quality.checks.map((c) => `${c.status.toUpperCase()} ${c.name}: ${c.detail}`).join('\n') },
+      smoke: { checks: [{ name: 'stack-specific smoke/e2e', ok: quality.checks.some((c) => c.name === 'playwright-e2e' && c.status === 'passed'), detail: 'See structured quality results; Node-only HTTP smoke is not applicable.' }], stderr: '' },
+      stats: { stack: profile.stacks } };
   const st = loadState(slug);
   const history = st.history.map((h) => `iteration ${h.n}: ${h.theme} (score ${h.score}, ${h.done}/${h.tasks} tasks done)`).join('\n') || 'none (this is the first evaluation)';
   const open = listTasks(slug).filter((t) => t.status !== 'Done').map((t) => `${t.id} ${t.title} [${t.labels.includes('blocked') ? 'BLOCKED' : t.status}]`).join('\n') || 'none';
@@ -333,10 +478,10 @@ async function evaluate(slug, n) {
   const prompt = `PRODUCT: ${idea.title} - ${idea.tagline || ''}\nDECLARED DEPENDENCIES: ${declared(dir).join(', ') || 'none'}\nPOSSIBLE HAND-ROLLED CODE (heuristic; verify): ${hand.join(' | ') || 'none detected'}\nProblem: ${idea.problem}\nAudience: ${idea.audience}\nMonetization: ${idea.monetization}\n` +
     `Planned mvp_scope: ${JSON.stringify(idea.mvp_scope)}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
     (idea.human_constraints?.length ? `HUMAN CONSTRAINTS:\n- ${idea.human_constraints.join('\n- ')}\n` : '') +
-    `\nEARLIER ITERATIONS:\n${history}\n\nOPEN/BLOCKED TASKS:\n${open}\n\nMECHANICAL RESULTS\nTests ${mech.tests.ok ? 'PASSED' : 'FAILED'}:\n${mech.tests.out.slice(-1500)}\nSmoke test:\n${smoke}\nServer stderr: ${mech.smoke.stderr || '(none)'}\nStats: ${JSON.stringify(mech.stats)}\n\nFILE TREE:\n${tree(dir)}\n\nSOURCE:\n${snapshot(dir)}`;
+    `\nPRODUCTION ARCHITECTURE DECISION:\n${JSON.stringify(idea.production_architecture || {}, null, 1)}\n\nEARLIER ITERATIONS:\n${history}\n\nOPEN/BLOCKED TASKS:\n${open}\n\nMECHANICAL RESULTS\nDetected stack: ${profile.stacks.join(', ') || 'UNSUPPORTED'}\nTests ${mech.tests.ok ? 'PASSED' : 'FAILED'}:\n${mech.tests.out.slice(-1500)}\nSmoke test:\n${smoke}\nServer stderr: ${mech.smoke.stderr || '(none)'}\nStats: ${JSON.stringify(mech.stats)}\nQuality checks (SKIPPED is not PASS):\n${quality.checks.map((c) => `${c.status.toUpperCase()} ${c.name} [required=${c.required}]: ${c.detail}`).join('\n')}\n\nFILE TREE:\n${tree(dir)}\n\nSOURCE:\n${snapshot(dir)}`;
   const ev = await chatJson('evaluator', persona('evaluator') + '\n\n' + RULES(), prompt);
   ev.quality_score = Number(ev.quality_score) || 0;
-  ev.mechanical = { tests_ok: mech.tests.ok, smoke: mech.smoke.checks, stats: mech.stats };
+  ev.mechanical = { tests_ok: mech.tests.ok, smoke: mech.smoke.checks, stats: mech.stats, quality: quality.checks };
   log('evaluate', { slug, msg: `iteration ${n}: score ${ev.quality_score}/10, tests ${mech.tests.ok ? 'pass' : 'FAIL'}, smoke ${mech.smoke.checks.filter((c) => !c.ok).length} failing` });
   return ev;
 }
@@ -344,7 +489,7 @@ async function evaluate(slug, n) {
 async function planIteration(slug, n, ev, feedback) {
   const idea = loadIdea(slug);
   const max = cfg.iterate.maxTasksPerIteration;
-  const prompt = `Plan iteration ${n}. Maximum tasks: ${max}. Task titles must start with "I${n}: ".\n\nPRODUCT: ${idea.title}\nProblem: ${idea.problem}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
+  const prompt = `Plan iteration ${n}. Maximum tasks: ${max}. Task titles must start with "I${n}: ".\n\nPRODUCT: ${idea.title}\nProblem: ${idea.problem}\nPRODUCTION ARCHITECTURE (preserve unless evaluation proves a concrete issue): ${JSON.stringify(idea.production_architecture || {})}\nphase2: ${JSON.stringify(idea.phase2)}\nphase3: ${JSON.stringify(idea.phase3)}\n` +
     (idea.human_constraints?.length ? `HUMAN CONSTRAINTS (mandatory):\n- ${idea.human_constraints.join('\n- ')}\n` : '') +
     (feedback ? `\nHUMAN/COMPLIANCE FEEDBACK ON THE PREVIOUS PLAN (mandatory):\n${feedback}\n` : '') +
     `\nEARLIER ITERATIONS:\n${loadState(slug).history.map((h) => `${h.n}: ${h.theme}`).join('\n') || 'none'}\n\nEVALUATION:\n${JSON.stringify({ ...ev, mechanical: { tests_ok: ev.mechanical.tests_ok, failing_smoke: ev.mechanical.smoke.filter((c) => !c.ok), stats: ev.mechanical.stats } }, null, 1)}`;
