@@ -12,8 +12,10 @@
     "analyst": "qwen3-coder:30b",
     "evaluator": "qwen3-coder:30b",
     "scout": "qwen3-coder:30b",
-    "reviewer": "qwen3:8b"
+    "reviewer": "qwen3:8b",
+    "fidelity": "qwen3-coder:30b"
   },
+  "ideation": { "briefCount": 4, "maxRevisions": 2, "minFidelity": 7, "marketCheck": true },
   "providers": {
     "github": { "type": "openai", "baseUrl": "https://models.github.ai/inference", "apiKeyEnv": "GITHUB_MODELS_TOKEN", "enabled": false, "dailyTokenCap": 500000, "maxOutputTokens": 8192 },
     "openai": { "type": "openai", "baseUrl": "https://api.openai.com/v1", "apiKeyEnv": "OPENAI_API_KEY", "enabled": false, "dailyTokenCap": 500000, "maxOutputTokens": 8192 },

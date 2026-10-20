@@ -11,7 +11,7 @@ import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
 import { runQualityGates, detectProfile, ensureCiWorkflow, ensureEditorConfig, ensureDependabot } from './lib/quality.mjs';
 import { ensureDeps, ensureNodeProject, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
 import { scout, toolsList, toolsDecide } from './lib/scout.mjs';
-import { gatherSignals, loadFreshResearch, saveResearch } from './lib/research.mjs';
+import { gatherSignals, loadFreshResearch, saveResearch, deepRead, sourceText, verifyQuotes, marketCheck } from './lib/research.mjs';
 
 const RULES = () => `GOLDEN RULES:\n${rulesText()}\n\n${principles()}\n${platformText()}\n${preferredText()}`;
 const read = (f) => fs.readFileSync(f, 'utf8');
@@ -37,17 +37,59 @@ async function research(force = false) {
 }
 
 // ---------- 1. IDEATE ----------
+// Deep-read the sources behind the top opportunities and turn each into a verified needs brief.
+async function buildBriefs(r) {
+  const ic = cfg.ideation || {};
+  const briefs = [];
+  for (const o of r.opportunities.slice(0, ic.briefCount ?? 4)) {
+    haltCheck();
+    const sources = [];
+    for (const u of o.evidence.slice(0, 2)) { const d = await deepRead(u); if (d) sources.push(d); }
+    if (!sources.length) { log('ideate', { msg: `skip "${o.saas_concept}": no readable source text` }); continue; }
+    const text = sources.map((d, i) => `SOURCE ${i + 1} (${d.host}) ${d.url}\n${sourceText(d)}`).join('\n\n').slice(0, 11000);
+    let b;
+    try { b = await chatJson('analyst', persona('needs') + '\n\n' + RULES(), `Analyst's first-pass concept (may be wrong; trust the sources over it): ${o.saas_concept}\n\n${text}`); }
+    catch (e) { log('ideate', { msg: `needs analysis failed: ${e.message}` }); continue; }
+    b.user_quotes = verifyQuotes(b.user_quotes, sources.map(sourceText));
+    if (!b.user_quotes.length) { log('ideate', { msg: `drop "${o.saas_concept}": no verifiable user quotes` }); continue; }
+    if (b.demand_type === 'not-a-product') { log('ideate', { msg: `drop "${o.saas_concept}": ${b.not_a_product_reason || 'not a product'}` }); continue; }
+    b.sources = sources.map((d) => d.url);
+    b.alternatives = ic.marketCheck === false ? [] : await marketCheck(b.search_terms).catch(() => []);
+    briefs.push(b);
+  }
+  return briefs;
+}
+
 async function ideate(hint = '') {
   haltCheck();
+  const ic = cfg.ideation || {};
   const existing = exists(paths.ideas) ? fs.readdirSync(paths.ideas).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', '')) : [];
   const r = await research();
-  const idea = await chatJson('strategist', persona('strategist') + '\n\n' + RULES(),
-    `Existing ideas (do not duplicate): ${existing.join(', ') || 'none'}.\n${hint ? 'Human hint: ' + hint : 'Choose the best opportunity.'}\n\nResearched opportunities:\n${JSON.stringify(r.opportunities, null, 1)}`);
-  if (!Array.isArray(idea.evidence) || !idea.evidence.length) idea.evidence = r.opportunities[0].evidence;
+  const briefs = await buildBriefs(r);
+  if (!briefs.length) throw new Error('no opportunity survived deep reading; refusing to guess what users want');
+  log('ideate', { msg: `${briefs.length} verified needs briefs` });
+  const numbered = briefs.map((b, i) => ({ id: i, ...b }));
+  let idea, fid, feedback = '';
+  for (let rev = 0; rev <= (ic.maxRevisions ?? 2); rev++) {
+    idea = await chatJson('strategist', persona('strategist') + '\n\n' + RULES(),
+      `Existing ideas (do not duplicate): ${existing.join(', ') || 'none'}.\n${hint ? 'Human hint: ' + hint : 'Choose the best brief.'}\n\nNEEDS BRIEFS:\n${JSON.stringify(numbered, null, 1)}${feedback}`);
+    const brief = numbered[Number(idea.source_brief)] ?? numbered[0];
+    idea.source_brief = brief.id;
+    idea.evidence = brief.sources;
+    fid = await chatJson('fidelity', persona('fidelity') + '\n\n' + RULES(),
+      JSON.stringify({ brief, idea: { title: idea.title, solution_form: idea.solution_form, problem: idea.problem, audience: idea.audience, differentiator: idea.differentiator, quotes_addressed: idea.quotes_addressed, mvp_scope: idea.mvp_scope, phase2: idea.phase2, phase3: idea.phase3, monetization: idea.monetization } }));
+    log('ideate', { msg: `fidelity ${fid.score}/10 faithful=${fid.faithful} (revision ${rev})` });
+    if (fid.faithful && Number(fid.score) >= (ic.minFidelity ?? 7)) break;
+    feedback = `\n\nThe fidelity reviewer REJECTED your last proposal ("${idea.title}"). Gaps: ${(fid.gaps || []).join('; ')}. Missed pains: ${(fid.missed_pains || []).join('; ')}. Fix: ${fid.fix}. Revise it, or pick a different brief.`;
+  }
   idea.name = slugify(idea.name || idea.title);
+  idea.source_brief_detail = numbered[idea.source_brief];
+  idea.fidelity = fid;
+  const passed = fid.faithful && Number(fid.score) >= (ic.minFidelity ?? 7);
   const hit = denylistHit(JSON.stringify(idea));
   let verdict = { approved: !hit, violations: hit ? [`denylist match: ${hit}`] : [], needs_human: [] };
-  if (!hit) verdict = await chatJson('compliance', persona('compliance') + '\n\n' + RULES(), JSON.stringify(idea));
+  if (!passed) verdict = { approved: false, violations: [`failed fidelity review (${fid.score}/10): ${(fid.gaps || []).join('; ')}`], needs_human: [] };
+  else if (!hit) verdict = await chatJson('compliance', persona('compliance') + '\n\n' + RULES(), JSON.stringify({ ...idea, source_brief_detail: undefined }));
   idea.compliance = verdict;
   idea.status = verdict.approved ? 'approved' : 'rejected';
   fs.writeFileSync(path.join(paths.ideas, idea.name + '.json'), JSON.stringify(idea, null, 2));

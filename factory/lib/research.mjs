@@ -3,7 +3,7 @@ import path from 'node:path';
 import { ROOT, log, haltCheck } from './core.mjs';
 
 // Read-only market research. GET requests to an allowlist of public, keyless APIs. Nothing is posted, no accounts, no spend.
-const ALLOW = new Set(['hn.algolia.com', 'api.stackexchange.com', 'api.github.com', 'lobste.rs', 'dev.to']);
+const ALLOW = new Set(['hn.algolia.com', 'api.stackexchange.com', 'api.github.com', 'lobste.rs', 'dev.to', 'registry.npmjs.org']);
 const UA = 'software-factory-research/1.0 (read-only, low-rate)';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const yearAgo = () => Math.floor(Date.now() / 1000) - 365 * 86400;
@@ -122,6 +122,68 @@ export async function gatherSignals() {
   const out = [];
   while (out.length < 60 && [...groups.values()].some((g) => g.length)) for (const g of groups.values()) if (g.length && out.length < 60) out.push(g.shift());
   return out;
+}
+
+// ---- deep read: full text of a cited source (body + top comments), read-only, no author names ----
+export function parseSource(url) {
+  let u;
+  try { u = new URL(url); } catch { return null; }
+  let m;
+  if (u.hostname === 'github.com' && (m = u.pathname.match(/^\/([^/]+)\/([^/]+)\/(issues|pull|discussions)\/(\d+)/)) && m[3] === 'issues') return { kind: 'github', owner: m[1], repo: m[2], n: m[4] };
+  if (u.hostname === 'news.ycombinator.com' && (m = u.searchParams.get('id'))) return { kind: 'hn', id: m };
+  if (/\.stackexchange\.com$/.test(u.hostname) && (m = u.pathname.match(/^\/questions\/(\d+)/))) return { kind: 'se', site: u.hostname, id: m[1] };
+  return null;
+}
+const tidy = (s, n) => clean(s, n);
+export async function deepRead(url) {
+  const src = parseSource(url);
+  if (!src) return null;
+  try {
+    if (src.kind === 'github') {
+      const base = `https://api.github.com/repos/${src.owner}/${src.repo}/issues/${src.n}`;
+      const issue = await getJson(base);
+      const cs = await getJson(base + '/comments?per_page=100');
+      const ranked = [...cs].sort((a, b) => (b.reactions?.total_count ?? 0) - (a.reactions?.total_count ?? 0));
+      const picked = [...new Set([...cs.slice(0, 6), ...ranked.slice(0, 6)])].slice(0, 12);
+      return { url, host: `github.com/${src.owner}/${src.repo}`, title: tidy(issue.title, 200), body: tidy(issue.body, 3000), comments: picked.map((c) => tidy(c.body, 600)) };
+    }
+    if (src.kind === 'hn') {
+      const j = await getJson(`https://hn.algolia.com/api/v1/items/${src.id}`);
+      const top = (j.children || []).filter((c) => c.text).sort((a, b) => (b.points ?? 0) - (a.points ?? 0)).slice(0, 10);
+      return { url, host: 'news.ycombinator.com', title: tidy(j.title, 200), body: tidy(j.text, 3000), comments: top.map((c) => tidy(c.text, 600)) };
+    }
+    if (src.kind === 'se') {
+      const site = src.site.replace(/\.stackexchange\.com$/, '');
+      const q = await getJson(`https://api.stackexchange.com/2.3/questions/${src.id}?site=${site}&filter=withbody`);
+      const a = await getJson(`https://api.stackexchange.com/2.3/questions/${src.id}/answers?site=${site}&filter=withbody&sort=votes&pagesize=5`);
+      const it = q.items?.[0];
+      if (!it) return null;
+      return { url, host: src.site, title: tidy(it.title, 200), body: tidy(it.body, 3000), comments: (a.items || []).map((x) => tidy(x.body, 600)) };
+    }
+  } catch (e) { log('research-source-failed', { msg: `deep-read ${url}: ${e.message}` }); }
+  return null;
+}
+export const sourceText = (d) => [d.title, d.body, ...d.comments].join('\n');
+
+// A quote counts only if it appears verbatim (ignoring case/whitespace) in the fetched sources.
+export function verifyQuotes(quotes, texts) {
+  const norm = (s) => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
+  const hay = texts.map(norm);
+  return (quotes || []).map(String).filter((q) => norm(q).length >= 12 && hay.some((h) => h.includes(norm(q))));
+}
+
+// ---- market check: what already exists (npm packages, GitHub repositories) ----
+export async function marketCheck(terms, per = 5) {
+  const out = [];
+  for (const t of (terms || []).slice(0, 3)) {
+    const q = encodeURIComponent(String(t).slice(0, 80));
+    const npm = await getJson(`https://registry.npmjs.org/-/v1/search?text=${q}&size=${per}`).catch(() => ({ objects: [] }));
+    for (const o of npm.objects || []) out.push({ term: t, source: 'npm', name: o.package.name, description: tidy(o.package.description, 140), url: o.package.links?.npm, updated: (o.package.date || '').slice(0, 10) });
+    const gh = await getJson(`https://api.github.com/search/repositories?q=${q}&sort=stars&per_page=${per}`).catch(() => ({ items: [] }));
+    for (const r of gh.items || []) out.push({ term: t, source: 'github', name: r.full_name, description: tidy(r.description, 140), url: r.html_url, stars: r.stargazers_count, updated: (r.pushed_at || '').slice(0, 10) });
+  }
+  const seen = new Set();
+  return out.filter((x) => x.url && !seen.has(x.url) && seen.add(x.url));
 }
 
 export function loadFreshResearch(maxAgeHours = 12) {
