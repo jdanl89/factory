@@ -4,3 +4,20 @@ HALT
 
 secrets/
 
+
+# Product-specific state (per-run, never committed)
+factory/state/*
+!factory/state/.gitkeep
+backlog/*
+!backlog/config.yml
+approvals/*
+!approvals/.gitkeep
+ideas/*
+!ideas/.gitkeep
+research/*
+!research/.gitkeep
+openspec/changes/*
+!openspec/changes/archive/
+openspec/changes/archive/*
+!openspec/changes/archive/.gitkeepproducts/*
+!products/.gitkeep
