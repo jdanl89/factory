@@ -4,14 +4,14 @@ Autonomous, local-first product factory. Agents choose what to build, spec it, b
 review it, and package it for **you** to publish. You own `GOLDEN_RULES.md` and `approvals/`.
 
 ## Pipeline
-`ideate â†’ compliance check â†’ plan â†’ build (TDD + review gate) â†’ release package â†’ human approval`
+`ideate Ã¢â€ â€™ compliance check Ã¢â€ â€™ plan Ã¢â€ â€™ build (TDD + review gate) Ã¢â€ â€™ release package Ã¢â€ â€™ human approval`
 
 | Stage | Who (Ollama model) | Tool | Output |
 |---|---|---|---|
-| ideate | multi-lens research (paying demand, market gaps, non-developer pain, trends) scored by the analyst, then deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) â†’ strategist â†’ **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) â†’ compliance + regex denylist | â€“ | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
+| ideate | multi-lens research (paying demand, market gaps, non-developer pain, trends) scored by the analyst, then deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) Ã¢â€ â€™ strategist Ã¢â€ â€™ **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) Ã¢â€ â€™ compliance + regex denylist | Ã¢â‚¬â€œ | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
 | architecture + plan | architect, then PM (configured Ollama models) | **OpenSpec** (`openspec/changes/<slug>`, validated) + **backlog.md** tasks | production proposal + spec + tasks |
-| build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks â†’ Done |
-| release | release writer | â€“ | README + `approvals/*-publish.md` |
+| build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks Ã¢â€ â€™ Done |
+| release | release writer | Ã¢â‚¬â€œ | README + `approvals/*-publish.md` |
 
 ## Architecture and supported engineering stacks
 Every product receives a production-architecture proposal before planning. The architect compares plausible deployment models and services for the actual workload, including compute/runtime, API ingress, persistence, storage, identity/secrets, networking, observability, IaC, and checks-only CI. For relevant AWS APIs it considers Lambda + API Gateway, ECS/Fargate, Elastic Beanstalk, RDS, and DynamoDB rather than selecting services by habit. The chosen runtime and managed services determine the framework and language; the proposal and its assumptions are saved with the idea, OpenSpec change, and human approval request.
@@ -53,6 +53,9 @@ Any role in `factory.config.json` `models` can use a hosted model instead of (or
 ```
 A `provider:` prefix selects an entry in `providers` (`github` = GitHub Models, `openai`, `anthropic`, `openrouter`; add any OpenAI-compatible endpoint with `type: "openai"`). Unprefixed names are local Ollama. Providers are **disabled by default**; to use one, (1) set `providers.<name>.enabled` to `true` (your written permission to spend), (2) set its key in an environment variable (`GITHUB_MODELS_TOKEN` with `models:read`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`) before starting the factory, never in files, and (3) adjust `dailyTokenCap`. Once the cap is hit, or on any error, the factory falls through to the next entry in the role's list, so keep a local model last. Prompts (including product code) are sent to the provider. Run `node factory/cli.mjs models test <role>` to verify. GitHub Copilot subscriptions themselves have no API; GitHub Models is the supported GitHub route.
 
+## How a failed attempt is retried
+Files from a failed attempt stay in place, so the next attempt edits them. Each retry sees the latest failure plus a short memory of earlier ones, and files named in the failure are placed first in its context. Failures are scored (failing tests); a retry that makes things worse is reverted to the best state seen so far, and a task that stalls (`build.restartAfterStale` non-improving attempts) is reset once to a clean base with the lessons kept (`build.maxRestarts`). When all attempts fail the task is split into subtasks.
+
 ## Reuse over reinvention, and tool scouting
 - Products use standard frameworks and libraries (see `platforms` and `dependencies.preferred` in `factory.config.json`), not custom auth/crypto/validation code. Principles live in `agents/_principles.md` and are injected into every agent prompt.
 - For Node/TypeScript, engineers declare packages on a `DEPENDENCIES: a, b` line. The factory vets each one (registry lookup: license, deprecation, last release, weekly downloads, no install scripts/native builds), installs it with `--ignore-scripts`, rejects packages with high/critical `npm audit` findings, and rejects imports of undeclared packages. Agents never edit `package.json`.
@@ -81,8 +84,8 @@ Requires the initial build to be finished (no open non-iteration tasks).
 
 ## How the golden rules are enforced (not just requested)
 - Rules are injected into every agent prompt.
-- Hard denylist (gambling, dark patterns, malware, â€¦) runs in code on ideas and release copy, independent of any LLM.
-- Compliance agent must approve every idea; anything needing money/accounts/publishing â†’ `approvals/`.
+- Hard denylist (gambling, dark patterns, malware, Ã¢â‚¬Â¦) runs in code on ideas and release copy, independent of any LLM.
+- Compliance agent must approve every idea; anything needing money/accounts/publishing Ã¢â€ â€™ `approvals/`.
 - File writes are sandboxed to `products/<slug>/` (no traversal, `.git`, `node_modules`, secrets).
 - Generated product code that uses network/child_process/secret env vars is rejected.
 - Agents cannot publish, deploy, or spend: no credentials exist in this system.
@@ -92,5 +95,5 @@ Requires the initial build to be finished (no open non-iteration tasks).
 - Local models and available hardware affect speed and task success; larger models may take substantially longer. The factory can split and rescope blocked work, but still records a blocker rather than claiming success if it cannot complete a check or task.
 - Revenue needs you: creating a store/payment account, publishing, and support are human-only by rule 6.
   The factory prepares everything and lists exact steps in `approvals/`.
-- **squad-cli** is installed (`npx squad`) but is a GitHub Copilotâ€“based multi-agent runtime; it isn't wired
+- **squad-cli** is installed (`npx squad`) but is a GitHub CopilotÃ¢â‚¬â€œbased multi-agent runtime; it isn't wired
   into the Ollama pipeline. Use it interactively if you want a Copilot-driven team on top of this repo.

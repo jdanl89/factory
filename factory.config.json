@@ -39,7 +39,7 @@
     "blockHighOrCriticalVulnerabilities": true,
     "allowDeployInCi": false
   },
-  "build": { "attemptsSmall": 2, "attemptsLarge": 2, "maxSplitDepth": 2, "testTimeoutMs": 60000, "maxTasksPerCycle": 40 },
+  "build": { "attemptsSmall": 0, "attemptsLarge": 6, "restartAfterStale": 2, "maxRestarts": 1, "maxSplitDepth": 2, "testTimeoutMs": 60000, "maxTasksPerCycle": 40 },
   "loop": { "maxCyclesPerDay": 4, "sleepMinutes": 30 },
   "iterate": { "afterRelease": "manual", "maxIterations": 25, "maxTasksPerIteration": 8, "convergeScore": 9 },
   "dependencies": {

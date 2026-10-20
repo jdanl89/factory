@@ -7,6 +7,7 @@ import {
   chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman, setScope, stopFile,
 } from './lib/core.mjs';
 import { parseSpec, specsFor, blockedReason, readUsage } from './lib/providers.mjs';
+import { failScore, prioritize, lessons } from './lib/iterate.mjs';
 import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
 import { runQualityGates, detectProfile, ensureCiWorkflow, ensureEditorConfig, ensureDependabot } from './lib/quality.mjs';
 import { ensureDeps, ensureNodeProject, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
@@ -236,15 +237,15 @@ function materialize(slug, pl, changeName, extraLabels) {
   }
 
 // ---------- 3. BUILD (TDD loop with test + review gates) ----------
-function snapshot(dir) {
+function snapshot(dir, focus = '') {
   const out = [];
   const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) {
     if (e.name === '.git' || e.name === 'node_modules' || e.name === 'package-lock.json') continue;
     const f = path.join(d, e.name);
-    e.isDirectory() ? walk(f) : out.push(`FILE: ${path.relative(dir, f).replace(/\\/g, '/')}\n\`\`\`\n${read(f).slice(0, 6000)}\n\`\`\``);
+    e.isDirectory() ? walk(f) : out.push({ rel: path.relative(dir, f).replace(/\\/g, '/'), f });
   } };
   if (exists(dir)) walk(dir);
-  return out.join('\n').slice(0, 24000);
+  return prioritize(out, focus).map(({ rel, f }) => `FILE: ${rel}\n\`\`\`\n${read(f).slice(0, 6000)}\n\`\`\``).join('\n').slice(0, 24000);
 }
 function parseFiles(text) {
   const files = [];
@@ -272,46 +273,73 @@ function applyFiles(dir, files, deps = declared(dir)) {
 }
 const setStatus = (t, s) => backlog(['task', 'edit', num(t), '-s', s]);
 
-// Escalation ladder: small model first, then the large (slow) model.
+// Escalation ladder: small model first, then the large (slow) model. Each retry iterates on the previous work
+// with the latest failure plus a memory of earlier ones; a retry that makes things worse is reverted to the
+// best state seen, and a stalled task restarts once from a clean base with the lessons learned.
 async function buildTask(slug, dir, task) {
   const idea = JSON.parse(read(path.join(paths.ideas, slug + '.json')));
-  let feedback = '';
+  let feedback = '', note = '';
+  const history = [];
+  let best = null, stale = 0, restarts = 0;
   const ladder = [...Array(cfg.build.attemptsSmall).fill('engineer'), ...Array(cfg.build.attemptsLarge).fill('engineerLarge')];
+  const fail = (attempt, role, text) => { feedback = text; history.push(`attempt ${attempt} (${role}): ${text}`); };
   for (let attempt = 1; attempt <= ladder.length; attempt++) {
     haltCheck();
     const role = ladder[attempt - 1];
-    const prompt = `Product: ${idea.title}\n${idea.problem}\nSelected tech stack: ${JSON.stringify(idea.tech_stack || {})}\nProduction architecture proposal (do not provision or deploy): ${JSON.stringify(idea.production_architecture || {})}\n${idea.human_constraints?.length ? 'HUMAN CONSTRAINTS (mandatory, override anything else):\n- ' + idea.human_constraints.join('\n- ') + '\n' : ''}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}\n${feedback}`;
+    const prompt = `Product: ${idea.title}\n${idea.problem}\nSelected tech stack: ${JSON.stringify(idea.tech_stack || {})}\nProduction architecture proposal (do not provision or deploy): ${JSON.stringify(idea.production_architecture || {})}\n${idea.human_constraints?.length ? 'HUMAN CONSTRAINTS (mandatory, override anything else):\n- ' + idea.human_constraints.join('\n- ') + '\n' : ''}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nCurrent project files (they include your previous attempt; change only what is needed to fix the failures, and output each changed file in full):\n${snapshot(dir, feedback + task.body) || '(empty)'}\n${lessons(history.slice(0, -1))}${note}${feedback}`;
+    note = '';
     const reply = await chat(role, persona('engineer') + '\n\n' + RULES(), prompt, { temperature: 0.2 + attempt * 0.1 });
     const files = parseFiles(reply);
-    if (!files.length) { feedback = '\nYour last reply had no parsable FILE blocks. Follow the output format exactly.'; continue; }
+    if (!files.length) { fail(attempt, role, '\nYour last reply had no parsable FILE blocks. Follow the output format exactly.'); continue; }
     const dep = await ensureDeps(dir, slug, parseDependencies(reply));
     const depNote = dep.rejected.length ? '\nPackages rejected by the factory (choose a different standard package or built-in): ' + dep.rejected.map((r) => `${r.name} (${r.reason})`).join('; ') + '\n' : '';
     const problems = applyFiles(dir, files);
     if (depNote) problems.push(depNote);
-    if (problems.length) { feedback = '\nRejected by guard, fix these:\n' + problems.join('\n'); log('guard', { slug, msg: problems.join(' | ') }); continue; }
+    if (problems.length) { fail(attempt, role, '\nRejected by guard, fix these:\n' + problems.join('\n')); log('guard', { slug, msg: problems.join(' | ') }); continue; }
     if (files.some((f) => /\.(?:mjs|cjs|js|jsx|ts|tsx)$/.test(f.rel)) || dep.added.length) {
-      try { ensureNodeProject(dir, slug); } catch (e) { feedback = `\nCould not create the locked npm project manifest: ${e.message}`; continue; }
+      try { ensureNodeProject(dir, slug); } catch (e) { fail(attempt, role, `\nCould not create the locked npm project manifest: ${e.message}`); continue; }
     }
     const profile = detectProfile(dir, idea.tech_stack);
     if (profile.supported) { ensureCiWorkflow(dir, profile); ensureEditorConfig(dir); ensureDependabot(dir, profile); }
     const quality = await runQualityGates(dir, { stage: 'task', stackHint: idea.tech_stack });
     const failedChecks = quality.checks.filter((c) => c.status === 'failed');
     if (!quality.ok) {
-      feedback = `\nQuality gates FAILED (attempt ${attempt}). Fix all required failures:\n` + failedChecks.map((c) => `${c.name}: ${c.detail}`).join('\n');
-      log('quality-fail', { slug, msg: `${task.id}: ${failedChecks.map((c) => c.name).join(', ')}` });
+      const score = failScore(failedChecks);
+      fail(attempt, role, `\nQuality gates FAILED (attempt ${attempt}, ${score} failing). Fix all required failures:\n` + failedChecks.map((c) => `${c.name}: ${c.detail}`).join('\n'));
+      log('quality-fail', { slug, msg: `${task.id}: ${failedChecks.map((c) => c.name).join(', ')} (${score} failing)` });
+      if (!best || score < best.score) { best = { score, commit: checkpoint(dir) }; stale = 0; }
+      else {
+        stale++;
+        if (score > best.score && best.commit) { restore(dir, best.commit); note = `\nYour last attempt had ${score} failures versus ${best.score} before it, so it was reverted to the best earlier state shown above. Take a different approach to the remaining failures.\n`; log('build-revert', { slug, msg: `${task.id}: ${score} > ${best.score}, reverted to best` }); }
+      }
+      if (stale >= (cfg.build.restartAfterStale ?? 2) && restarts < (cfg.build.maxRestarts ?? 1) && attempt < ladder.length) {
+        rollback(dir); best = null; stale = 0; restarts++;
+        note = '\nProgress has stalled, so the working files were reset to the last committed state. Start over with a different design, applying the lessons below.\n';
+        log('build-restart', { slug, msg: `${task.id}: stalled, restarting from clean base` });
+      }
       continue;
     }
     const t = { ok: true, out: quality.checks.map((c) => `${c.status.toUpperCase()} ${c.name}: ${c.detail}`).join('\n') };
     const review = await chatJson('reviewer', persona('reviewer') + '\n\n' + RULES(),
       `Task: ${task.title}\n${task.body}\n\nSelected tech stack: ${JSON.stringify(idea.tech_stack || {})}\nProduction architecture: ${JSON.stringify(idea.production_architecture || {})}\nDetected stack: ${quality.profile.stacks.join(', ')}\nQuality-check evidence (never treat SKIPPED as passing):\n${t.out}\n\nFiles:\n${snapshot(dir)}`);
-    if (review.verdict !== 'pass') { feedback = '\nReviewer rejected:\n- ' + (review.issues || []).join('\n- '); log('review-fail', { slug, msg: feedback.slice(0, 200) }); continue; }
+    if (review.verdict !== 'pass') { fail(attempt, role, '\nReviewer rejected:\n- ' + (review.issues || []).join('\n- ')); log('review-fail', { slug, msg: feedback.slice(0, 200) }); continue; }
     return { ok: true, summary: review.summary };
   }
   return { ok: false, failure: feedback.slice(0, 3000) };
 }
 
 const commit = (dir, msg) => { git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', msg); };
-const rollback = (dir) => { git(dir, 'reset', '-q', '--hard'); git(dir, 'clean', '-fdq'); };
+const hasHead = (dir) => git(dir, 'rev-parse', '--verify', '-q', 'HEAD').status === 0;
+const rollback = (dir) => { if (hasHead(dir)) git(dir, 'reset', '-q', '--hard'); else git(dir, 'rm', '-rf', '--cached', '-q', '.'); git(dir, 'clean', '-fdq'); };
+// A checkpoint is a dangling commit of the working tree; restore() returns the tree to exactly that state.
+function checkpoint(dir) {
+  git(dir, 'add', '-A');
+  const tree = git(dir, 'write-tree').stdout.trim();
+  const args = ['-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit-tree', tree, '-m', 'factory-checkpoint'];
+  if (hasHead(dir)) args.push('-p', git(dir, 'rev-parse', 'HEAD').stdout.trim());
+  return git(dir, ...args).stdout.trim() || null;
+}
+function restore(dir, commitId) { rollback(dir); if (commitId) git(dir, 'checkout', commitId, '--', '.'); }
 const num = (t) => t.id.replace(/^\D+/, '');
 const depthOf = (t) => Math.max(0, ...t.labels.map((l) => (l.match(/^depth-(\d+)$/) || [, 0])[1]).map(Number));
 const openChildren = (slug, task) => listTasks(slug).filter((t) => t.parent === task.id && t.status !== 'Done');
