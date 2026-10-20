@@ -4,14 +4,14 @@ Autonomous, local-first product factory. Agents choose what to build, spec it, b
 review it, and package it for **you** to publish. You own `GOLDEN_RULES.md` and `approvals/`.
 
 ## Pipeline
-`ideate → compliance check → plan → build (TDD + review gate) → release package → human approval`
+`ideate â†’ compliance check â†’ plan â†’ build (TDD + review gate) â†’ release package â†’ human approval`
 
 | Stage | Who (Ollama model) | Tool | Output |
 |---|---|---|---|
-| ideate | multi-lens research (paying demand, market gaps, non-developer pain, trends) scored by the analyst, then deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) → strategist → **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) → compliance + regex denylist | – | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
+| ideate | multi-lens research (paying demand, market gaps, non-developer pain, trends) scored by the analyst, then deep-read + needs analyst (verbatim, verified user quotes; npm/GitHub market check) â†’ strategist â†’ **fidelity reviewer** (must prove the idea solves what users asked, else revise/reject) â†’ compliance + regex denylist | â€“ | `ideas/<slug>.json` (includes `source_brief_detail` and `fidelity`) |
 | architecture + plan | architect, then PM (configured Ollama models) | **OpenSpec** (`openspec/changes/<slug>`, validated) + **backlog.md** tasks | production proposal + spec + tasks |
-| build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks → Done |
-| release | release writer | – | README + `approvals/*-publish.md` |
+| build | engineer + reviewer (configured Ollama models) | stack-specific quality gates, code guards | `products/<slug>` (own git repo), tasks â†’ Done |
+| release | release writer | â€“ | README + `approvals/*-publish.md` |
 
 ## Architecture and supported engineering stacks
 Every product receives a production-architecture proposal before planning. The architect compares plausible deployment models and services for the actual workload, including compute/runtime, API ingress, persistence, storage, identity/secrets, networking, observability, IaC, and checks-only CI. For relevant AWS APIs it considers Lambda + API Gateway, ECS/Fargate, Elastic Beanstalk, RDS, and DynamoDB rather than selecting services by habit. The chosen runtime and managed services determine the framework and language; the proposal and its assumptions are saved with the idea, OpenSpec change, and human approval request.
@@ -37,6 +37,7 @@ node factory/cli.mjs research                       # fetch public demand signal
 node factory/cli.mjs approve <slug> [--note "constraint"]...   # accept an idea compliance rejected / add human constraints
 node factory/cli.mjs reject <slug>
 node factory/cli.mjs scrap <slug> [--yes]           # delete everything for an idea/product (dry-run without --yes)
+node factory/cli.mjs unblock <slug>                 # clear 'blocked' labels; next build resumes the task's existing subtasks
 node factory/cli.mjs halt | resume                  # kill switch (creates/removes HALT)
 node factory/cli.mjs models [test <role>]           # show role -> model chains, provider status, daily token use
 npx backlog board        # kanban TUI      npx backlog browser   # web UI
@@ -80,8 +81,8 @@ Requires the initial build to be finished (no open non-iteration tasks).
 
 ## How the golden rules are enforced (not just requested)
 - Rules are injected into every agent prompt.
-- Hard denylist (gambling, dark patterns, malware, …) runs in code on ideas and release copy, independent of any LLM.
-- Compliance agent must approve every idea; anything needing money/accounts/publishing → `approvals/`.
+- Hard denylist (gambling, dark patterns, malware, â€¦) runs in code on ideas and release copy, independent of any LLM.
+- Compliance agent must approve every idea; anything needing money/accounts/publishing â†’ `approvals/`.
 - File writes are sandboxed to `products/<slug>/` (no traversal, `.git`, `node_modules`, secrets).
 - Generated product code that uses network/child_process/secret env vars is rejected.
 - Agents cannot publish, deploy, or spend: no credentials exist in this system.
@@ -91,5 +92,5 @@ Requires the initial build to be finished (no open non-iteration tasks).
 - Local models and available hardware affect speed and task success; larger models may take substantially longer. The factory can split and rescope blocked work, but still records a blocker rather than claiming success if it cannot complete a check or task.
 - Revenue needs you: creating a store/payment account, publishing, and support are human-only by rule 6.
   The factory prepares everything and lists exact steps in `approvals/`.
-- **squad-cli** is installed (`npx squad`) but is a GitHub Copilot–based multi-agent runtime; it isn't wired
+- **squad-cli** is installed (`npx squad`) but is a GitHub Copilotâ€“based multi-agent runtime; it isn't wired
   into the Ollama pipeline. Use it interactively if you want a Copilot-driven team on top of this repo.

@@ -270,7 +270,7 @@ function applyFiles(dir, files, deps = declared(dir)) {
   }
   return problems;
 }
-const setStatus = (t, s) => backlog(['task', 'edit', t.id.replace(/\D/g, ''), '-s', s]);
+const setStatus = (t, s) => backlog(['task', 'edit', num(t), '-s', s]);
 
 // Escalation ladder: small model first, then the large (slow) model.
 async function buildTask(slug, dir, task) {
@@ -312,25 +312,28 @@ async function buildTask(slug, dir, task) {
 
 const commit = (dir, msg) => { git(dir, 'add', '-A'); git(dir, '-c', 'user.name=factory', '-c', 'user.email=factory@local', 'commit', '-qm', msg); };
 const rollback = (dir) => { git(dir, 'reset', '-q', '--hard'); git(dir, 'clean', '-fdq'); };
-const num = (t) => t.id.replace(/\D/g, '');
+const num = (t) => t.id.replace(/^\D+/, '');
 const depthOf = (t) => Math.max(0, ...t.labels.map((l) => (l.match(/^depth-(\d+)$/) || [, 0])[1]).map(Number));
+const openChildren = (slug, task) => listTasks(slug).filter((t) => t.parent === task.id && t.status !== 'Done');
 
 // Ask the large model to rescope a failing task into smaller, independently testable subtasks.
 async function split(slug, dir, task, failure) {
   const depth = depthOf(task) + 1;
+  const existing = openChildren(slug, task);
+  if (existing.length) { log('task-split', { slug, msg: `${task.id} reusing existing subtasks ${existing.map((t) => t.id).join(', ')}` }); return existing; }
   const idea = JSON.parse(read(path.join(paths.ideas, slug + '.json')));
   const out = await chatJson('planner', persona('splitter') + '\n\n' + RULES(),
     `PRODUCT TECH STACK: ${JSON.stringify(idea.tech_stack || {})}\nPRODUCTION ARCHITECTURE: ${JSON.stringify(idea.production_architecture || {})}\nTASK ${task.id}: ${task.title}\n${task.body}\n\nWhy it failed:\n${failure}\n\nCurrent project files:\n${snapshot(dir) || '(empty)'}`);
   const subs = (out.subtasks || []).slice(0, 4);
   if (subs.length < 2) return [];
-  const ids = [];
+  const before = new Set(listTasks(slug).map((t) => t.id));
   for (const [i, s] of subs.entries()) {
     const args = ['task', 'create', `${task.title} (${i + 1}/${subs.length}): ${s.title}`, '-d', `${s.description}\n\nFiles: ${(s.files || []).join(', ')}\nSplit from ${task.id}; ${out.note || ''}`,
       '-l', `${slug},depth-${depth}`, '-p', num(task), '--plain'];
     for (const a of s.acceptance || []) args.push('--ac', a);
     backlog(args);
   }
-  const fresh = listTasks(slug).filter((t) => t.labels.includes(`depth-${depth}`) && t.status !== 'Done' && t.title.startsWith(task.title + ' ('));
+  const fresh = listTasks(slug).filter((t) => !before.has(t.id) && t.parent === task.id);
   log('task-split', { slug, msg: `${task.id} -> ${fresh.map((t) => t.id).join(', ')}` });
   return fresh;
 }
@@ -339,7 +342,9 @@ async function split(slug, dir, task, failure) {
 async function runTask(slug, dir, task) {
   haltCheck();
   setStatus(task, 'In Progress');
-  const r = await buildTask(slug, dir, task);
+  // A task already split into subtasks resumes them instead of retrying the whole task.
+  const resumed = openChildren(slug, task);
+  const r = resumed.length ? { ok: false, failure: 'resuming previously created subtasks' } : await buildTask(slug, dir, task);
   if (r.ok) {
     commit(dir, `${task.id}: ${task.title}`);
     backlog(['task', 'edit', num(task), '-s', 'Done', '--final-summary', r.summary || 'Implemented, tests green, reviewed.']);
@@ -723,6 +728,14 @@ async function modelsStatus(testRole) {
   if (testRole) { const r = await chat(testRole, 'Reply with the single word: ok', 'ping', { temperature: 0 }); console.log(`test ${testRole}: ${JSON.stringify(r.slice(0, 80))}`); }
 }
 
+// Clears the locked label on a product's tasks so the next build resumes them (and any subtasks already created).
+function unblock(slug) {
+  if (!slug) throw new Error('usage: unblock <slug>');
+  const blocked = listTasks(slug).filter((t) => t.labels.includes('blocked'));
+  for (const t of blocked) backlog(['task', 'edit', num(t), '--remove-label', 'blocked']);
+  console.log(blocked.length ? `Unblocked: ${blocked.map((t) => t.id).join(', ')}\nNow run: node factory/cli.mjs build ${slug}` : 'No blocked tasks for ' + slug);
+}
+
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const cmds = {
   research: () => research(true).then((r) => r.opportunities.forEach((o) => console.log(`- [${o.demand_strength}, score ${o.total ?? "?"}, ${(o.lenses || []).join("+") || "general"}] ${o.saas_concept}\n    ${o.evidence.join(' ')}`))),
@@ -744,8 +757,9 @@ const cmds = {
   'tools-approve': () => toolsDecide(arg, 'approve', rest),
   'tools-reject': () => toolsDecide(arg, 'reject'),
   models: () => modelsStatus(arg === 'test' ? rest[0] || 'reviewer' : null),
+  unblock: () => unblock(arg),
   halt: () => fs.writeFileSync(path.join(ROOT, 'HALT'), 'stop'),
   resume: () => fs.rmSync(path.join(ROOT, 'HALT'), { force: true }),
 };
-if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|models [test <role>]|scout|tools|tools-approve <id> [--url U --roles r1,r2]|tools-reject <id>|halt|resume>'); process.exit(1); }
+if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|unblock <slug>|models [test <role>]|scout|tools|tools-approve <id> [--url U --roles r1,r2]|tools-reject <id>|halt|resume>'); process.exit(1); }
 Promise.resolve(cmds[cmd]()).catch((e) => { log('fatal', { msg: e.stack }); process.exit(1); });

@@ -159,18 +159,35 @@ export function backlog(args) {
   if (r.status !== 0) throw new Error('backlog ' + args.join(' ') + ': ' + (r.stderr || r.stdout));
   return r.stdout;
 }
+// Minimal YAML front-matter reader for Backlog.md task files: scalars, quoted/folded (>-, |) strings, inline [a, b] and block "- x" lists.
+export function parseFrontMatter(fm) {
+  const lines = fm.split(/\r?\n/), out = {};
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^([A-Za-z_]+):\s*(.*)$/);
+    if (!m) continue;
+    const [, k, rest] = m;
+    const cont = [];
+    while (i + 1 < lines.length && /^\s+\S|^\s*-\s/.test(lines[i + 1]) && !/^[A-Za-z_]+:/.test(lines[i + 1])) cont.push(lines[++i].trim());
+    if (rest.startsWith('[')) out[k] = (rest.match(/[^\s,\[\]'"]+/g) || []);
+    else if (!rest && cont.length && cont.every((c) => c.startsWith('-'))) out[k] = cont.map((c) => c.replace(/^-\s*/, '').replace(/^['"]|['"]$/g, '').trim());
+    else if (/^[>|][+-]?$/.test(rest)) out[k] = cont.join(' ');
+    else out[k] = (rest + (cont.length ? ' ' + cont.join(' ') : '')).replace(/^['"]|['"]$/g, '').trim();
+  }
+  return out;
+}
 export function listTasks(label) {
   const dir = p('backlog', 'tasks');
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter((f) => f.endsWith('.md')).map((f) => {
     const txt = fs.readFileSync(path.join(dir, f), 'utf8');
     const fm = (txt.match(/^---\r?\n([\s\S]*?)\r?\n---/) || [, ''])[1];
-    const get = (k) => (fm.match(new RegExp(`^${k}:\\s*(.*)$`, 'm')) || [, ''])[1].replace(/^['"]|['"]$/g, '').trim();
-    const labels = (get('labels').match(/[\w-]+/g) || []);
-    return { id: get('id'), title: get('title'), status: get('status'), labels, file: path.join(dir, f), body: txt.slice(fm.length + 8) };
+    const y = parseFrontMatter(fm);
+    const labels = [].concat(y.labels ?? []).map(String);
+    return { id: y.id || '', title: y.title || '', status: y.status || '', labels, parent: y.parent_task_id || '', file: path.join(dir, f), body: txt.slice(fm.length + 8) };
   }).filter((t) => !label || t.labels.includes(label))
-    .sort((a, b) => parseInt(a.id.replace(/\D/g, '')) - parseInt(b.id.replace(/\D/g, '')));
+    .sort((a, b) => idKey(a.id) - idKey(b.id));
 }
+const idKey = (id) => { const [m, s] = id.replace(/^\D+/, '').split('.'); return Number(m) * 1e4 + Number(s || 0); };
 
 // ---- running a product's tests (no shell, no network assumptions) ----
 export function runTests(dir) {
