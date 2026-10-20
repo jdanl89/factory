@@ -3,6 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { parseSpec, specsFor, blockedReason, callRemote, addUsage, stripJsonFences } from './providers.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'factory.config.json'), 'utf8'));
@@ -88,10 +89,28 @@ export const platformText = () => {
     `Cloud targets: ${(p.cloud || []).join(', ')}\nTesting: ${(p.testing || []).join(', ')}\nSelection must be explicit in the idea as tech_stack {frontend, backend, iac}; use \"none\" where a layer is not needed. Production architecture and services must be decided before framework/language; it is a proposal only until human spend approval.`;
 };
 
-// ---- ollama ----
-export async function chat(role, system, user, { json = false, temperature = 0.4 } = {}) {
-  const model = cfg.models[role];
+// ---- model routing: local Ollama or opt-in frontier providers ----
+const STATE = p('factory', 'state');
+export async function chat(role, system, user, opts = {}) {
   system += skillsFor(role);
+  const specs = specsFor(cfg.models[role]);
+  if (!specs.length) throw new Error('no model configured for role ' + role);
+  let last;
+  for (const spec of specs) {
+    const { provider, model, conf } = parseSpec(spec, cfg.providers);
+    try {
+      if (provider === 'ollama') return await chatOllama(role, model, system, user, opts);
+      const why = blockedReason(provider, conf, STATE);
+      if (why) { log('llm-skip', { role, msg: `${role}: ${spec} skipped: ${why}` }); last = new Error(why); continue; }
+      const r = await callRemote(provider, conf, model, system, user, opts);
+      addUsage(STATE, provider, r.tokens);
+      log('llm', { role, model: spec, msg: `${role}/${spec} ${r.tokens || '?'} tok` });
+      return stripJsonFences(r.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim());
+    } catch (e) { last = e; log('llm-error', { role, msg: `${role}: ${spec} failed: ${e.message}` }); }
+  }
+  throw last;
+}
+async function chatOllama(role, model, system, user, { json = false, temperature = 0.4 } = {}) {
   const body = {
     model, stream: false, think: false, keep_alive: cfg.ollama.keepAlive,
     options: { num_ctx: cfg.contextTokens, temperature },

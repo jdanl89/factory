@@ -6,6 +6,7 @@ import {
   ROOT, cfg, rulesText, principles, platformText, persona, log, haltCheck, denylistHit, slugify, safeJoin, codeViolations,
   chat, chatJson, backlog, listTasks, runTests, git, paths, requestHuman, setScope, stopFile,
 } from './lib/core.mjs';
+import { parseSpec, specsFor, blockedReason, readUsage } from './lib/providers.mjs';
 import { mechanicalEval, tree, ensureGitignore } from './lib/evaluate.mjs';
 import { runQualityGates, detectProfile, ensureCiWorkflow, ensureEditorConfig, ensureDependabot } from './lib/quality.mjs';
 import { ensureDeps, ensureNodeProject, parseDependencies, declared, undeclaredImports, preferredText } from './lib/deps.mjs';
@@ -664,6 +665,21 @@ async function loop() {
   }
 }
 
+async function modelsStatus(testRole) {
+  const state = path.join(ROOT, 'factory', 'state');
+  const usage = readUsage(state).tokens;
+  for (const [role, v] of Object.entries(cfg.models)) {
+    const chain = specsFor(v).map((s) => {
+      const { provider, conf } = parseSpec(s, cfg.providers);
+      const why = provider === 'ollama' ? null : blockedReason(provider, conf, state);
+      return `${s}${why ? `  [SKIPPED: ${why}]` : provider === 'ollama' ? '' : '  [ready]'}`;
+    });
+    console.log(`${role.padEnd(14)} ${chain.join('  ->  ')}`);
+  }
+  for (const [n, c] of Object.entries(cfg.providers || {})) console.log(`provider ${n}: ${c.enabled ? 'ENABLED' : 'disabled'}, tokens today ${usage[n] || 0}/${c.dailyTokenCap}`);
+  if (testRole) { const r = await chat(testRole, 'Reply with the single word: ok', 'ping', { temperature: 0 }); console.log(`test ${testRole}: ${JSON.stringify(r.slice(0, 80))}`); }
+}
+
 const [cmd, arg, ...rest] = process.argv.slice(2);
 const cmds = {
   research: () => research(true).then((r) => r.opportunities.forEach((o) => console.log(`- [${o.demand_strength}] ${o.saas_concept}\n    ${o.evidence.join(' ')}`))),
@@ -684,8 +700,9 @@ const cmds = {
   tools: () => toolsList(),
   'tools-approve': () => toolsDecide(arg, 'approve', rest),
   'tools-reject': () => toolsDecide(arg, 'reject'),
+  models: () => modelsStatus(arg === 'test' ? rest[0] || 'reviewer' : null),
   halt: () => fs.writeFileSync(path.join(ROOT, 'HALT'), 'stop'),
   resume: () => fs.rmSync(path.join(ROOT, 'HALT'), { force: true }),
 };
-if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|scout|tools|tools-approve <id> [--url U --roles r1,r2]|tools-reject <id>|halt|resume>'); process.exit(1); }
+if (!cmds[cmd]) { console.log('usage: node factory/cli.mjs <research|ideate [hint]|plan <slug>|build <slug>|release <slug>|cycle [hint]|loop|status|approve|reject|scrap <slug> [--yes]|iterate <slug> [--count N|--plan-only|--auto [--max N]]|iterate-approve <slug>|iterate-reject <slug>|iterate-stop <slug|all> [--now]|models [test <role>]|scout|tools|tools-approve <id> [--url U --roles r1,r2]|tools-reject <id>|halt|resume>'); process.exit(1); }
 Promise.resolve(cmds[cmd]()).catch((e) => { log('fatal', { msg: e.stack }); process.exit(1); });

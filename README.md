@@ -38,11 +38,19 @@ node factory/cli.mjs approve <slug> [--note "constraint"]...   # accept an idea 
 node factory/cli.mjs reject <slug>
 node factory/cli.mjs scrap <slug> [--yes]           # delete everything for an idea/product (dry-run without --yes)
 node factory/cli.mjs halt | resume                  # kill switch (creates/removes HALT)
+node factory/cli.mjs models [test <role>]           # show role -> model chains, provider status, daily token use
 npx backlog board        # kanban TUI      npx backlog browser   # web UI
 npx openspec list        # spec changes
 ```
 Logs: `factory/state/ledger.jsonl`.
 
+## Frontier models (optional, human opt-in)
+Any role in `factory.config.json` `models` can use a hosted model instead of (or before) a local one. A value is either a string or a fallback list tried in order:
+```json
+"engineerLarge": ["github:openai/gpt-4.1", "qwen3-coder:30b"],
+"architect": "anthropic:claude-sonnet-4-5"
+```
+A `provider:` prefix selects an entry in `providers` (`github` = GitHub Models, `openai`, `anthropic`, `openrouter`; add any OpenAI-compatible endpoint with `type: "openai"`). Unprefixed names are local Ollama. Providers are **disabled by default**; to use one, (1) set `providers.<name>.enabled` to `true` (your written permission to spend), (2) set its key in an environment variable (`GITHUB_MODELS_TOKEN` with `models:read`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`) before starting the factory, never in files, and (3) adjust `dailyTokenCap`. Once the cap is hit, or on any error, the factory falls through to the next entry in the role's list, so keep a local model last. Prompts (including product code) are sent to the provider. Run `node factory/cli.mjs models test <role>` to verify. GitHub Copilot subscriptions themselves have no API; GitHub Models is the supported GitHub route.
 
 ## Reuse over reinvention, and tool scouting
 - Products use standard frameworks and libraries (see `platforms` and `dependencies.preferred` in `factory.config.json`), not custom auth/crypto/validation code. Principles live in `agents/_principles.md` and are injected into every agent prompt.
