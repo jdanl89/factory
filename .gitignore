@@ -19,5 +19,6 @@ research/*
 openspec/changes/*
 !openspec/changes/archive/
 openspec/changes/archive/*
-!openspec/changes/archive/.gitkeepproducts/*
+!openspec/changes/archive/.gitkeep
+products/*
 !products/.gitkeep
